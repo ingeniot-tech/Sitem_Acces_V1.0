@@ -1,0 +1,338 @@
+Aquí tienes la documentación técnica completa en formato **Markdown (.md)**. Está estructurada para que puedas incluirla en tu repositorio del proyecto (como `README_RTC.md` o `DOCS_RTC.md`) y te sirva de guía para integrar el módulo de tiempo en tu lógica de control de puertas.
+
+Puedes copiar y pegar el siguiente bloque directamente en un archivo de texto o editor de código:
+
+```markdown
+# Documentación del Módulo RTC (Real Time Clock) para Arduino Giga R1 WiFi
+
+## 1. Descripción General
+La placa Arduino Giga R1 WiFi utiliza el microcontrolador STM32H7, el cual posee un RTC interno. Sin embargo, para garantizar la precisión del reloj y la persistencia de la hora tras cortes de energía, se requiere una configuración específica de hardware (Batería) y software (Parche de oscilador LSE).
+
+Este documento detalla la implementación para obtener fechas y horas precisas (Timestamps) para el sistema de control de acceso.
+
+---
+
+## 2. Configuración de Hardware
+
+Para que el RTC funcione en modo "Offline" (sin alimentación USB/Vin), se debe conectar una batería externa:
+
+* **Tipo de Batería:** Pila de botón CR2032 (3V).
+* **Conexión en la Giga R1:**
+    * Polo Positivo (+) -> Pad **VRTC** (Voltaje soportado: 1.2V a 3.6V).
+    * Polo Negativo (-) -> Pad **GND**.
+
+> **Nota:** El pad `OFF` que se encuentra junto a VRTC se utiliza para apagar la placa completamente cuando se alimenta por batería LiPo, no es necesario para el circuito del RTC.
+
+---
+
+Codigo ejemplo obtener hora online conectandose a wifi 
+
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <mbed_mktime.h>
+
+// ======================================================================
+// PARCHE OFICIAL PARA MEJORAR LA PRECISIÓN DEL RTC EN LA GIGA R1
+// Fuerza al cristal externo LSE a operar en alto rendimiento (HIGH drive)
+// ======================================================================
+class FixRTC {
+  public:
+    FixRTC() {
+      // Usamos funciones de bajo nivel (LL) del STM32
+      LL_RCC_LSE_Disable();
+      LL_RCC_LSE_SetDriveCapability(LL_RCC_LSEDRIVE_HIGH);
+      LL_RCC_LSE_Enable();
+    }
+};
+// Esta línea asegura que el parche se ejecute antes de que inicie la placa
+FixRTC fixrtc __attribute__ ((init_priority (101)));
+// ======================================================================
+
+// Datos de red
+char ssid[] = "TU_RED_WIFI";       
+char pass[] = "TU_CONTRASEÑA";     
+
+// Configuración NTP y Zona Horaria
+int timezone = -5; // Zona horaria para Medellín (UTC-5)
+constexpr auto timeServer{ "pool.ntp.org" };
+unsigned int localPort = 2390;
+const int NTP_PACKET_SIZE = 48;
+byte packetBuffer[NTP_PACKET_SIZE];
+WiFiUDP Udp;
+
+constexpr unsigned long printInterval{ 1000 };
+unsigned long printNow{};
+
+void setup() {
+  Serial.begin(9600);
+  while (!Serial); // Espera a que se abra el monitor serie
+
+  if (WiFi.status() == WL_NO_MODULE) {
+    Serial.println("Error: Modulo WiFi no detectado.");
+    while (true);
+  }
+
+  Serial.print("Conectando a la red WiFi: ");
+  Serial.println(ssid);
+  
+  while (WiFi.begin(ssid, pass) != WL_CONNECTED) {
+    Serial.print(".");
+    delay(5000);
+  }
+  
+  Serial.println("\nWiFi conectado con exito.");
+  
+  // Sincronizar el RTC interno utilizando el servidor NTP de Internet
+  setNtpTime();
+}
+
+void loop() {
+  if (millis() > printNow) {
+    Serial.print("Hora RTC (Medellín): ");
+    Serial.println(getLocaltime());
+    printNow = millis() + printInterval;
+  }
+}
+
+// -------------------------------------------------------------
+// FUNCIONES DE SINCRONIZACIÓN Y FORMATEO DE HORA
+// -------------------------------------------------------------
+void setNtpTime() {
+  Udp.begin(localPort);
+  sendNTPpacket(timeServer);
+  delay(1000);
+  parseNtpPacket();
+}
+
+void sendNTPpacket(const char * address) {
+  memset(packetBuffer, 0, NTP_PACKET_SIZE);
+  packetBuffer[0] = 0b11100011;   
+  packetBuffer[1] = 0;     
+  packetBuffer[2] = 6;     
+  packetBuffer[3] = 0xEC;  
+  packetBuffer[12] = 49;
+  packetBuffer[13] = 0x4E;
+  packetBuffer[14] = 49;
+  packetBuffer[15] = 52;
+  
+  Udp.beginPacket(address, 123); 
+  Udp.write(packetBuffer, NTP_PACKET_SIZE);
+  Udp.endPacket();
+}
+
+unsigned long parseNtpPacket() {
+  if (!Udp.parsePacket()) return 0;
+  
+  Udp.read(packetBuffer, NTP_PACKET_SIZE);
+  const unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
+  const unsigned long lowWord = word(packetBuffer[42], packetBuffer[43]);
+  const unsigned long secsSince1900 = highWord << 16 | lowWord;
+  constexpr unsigned long seventyYears = 2208988800UL;
+  const unsigned long epoch = secsSince1900 - seventyYears;
+  
+  // Aplicamos el desfase de la zona horaria en segundos (horas * 3600)
+  const unsigned long localEpoch = epoch + (timezone * 3600);
+  
+  // Establecemos el RTC nativo de MbedOS en la Giga R1
+  set_time(localEpoch);
+  return localEpoch;
+}
+
+String getLocaltime() {
+  char buffer[32];
+  tm t;
+  // Obtenemos la hora actual almacenada y procesada por el RTC
+  _rtc_localtime(time(NULL), &t, RTC_FULL_LEAP_YEAR_SUPPORT);
+  // Formateamos la salida a: YYYY-MM-DD HH:MM:SS
+  strftime(buffer, 32, "%Y-%m-%d %H:%M:%S", &t);
+  return String(buffer);
+}
+
+
+ahora un ejemplo de como conectarse offline despues de haber configurado la hora 
+
+La solución: Un código exclusivo para lectura (Offline)
+Para comprobar de forma aislada que la batería CR2032 está haciendo su trabajo y que el RTC retiene la hora sin depender de internet, debemos quitar por completo cualquier referencia al WiFi.
+
+Carga este nuevo código en tu placa. Es una versión reducida que solo lee el RTC y lo imprime en el monitor serie:
+
+
+#include <mbed_mktime.h>
+
+// ======================================================================
+// PARCHE OFICIAL DEL RTC (Mantenemos la configuración en HIGH)
+// ======================================================================
+class FixRTC {
+  public:
+    FixRTC() {
+      LL_RCC_LSE_Disable();
+      LL_RCC_LSE_SetDriveCapability(LL_RCC_LSEDRIVE_HIGH);
+      LL_RCC_LSE_Enable();
+    }
+};
+FixRTC fixrtc __attribute__ ((init_priority (101)));
+// ======================================================================
+
+constexpr unsigned long printInterval{ 1000 };
+unsigned long printNow{};
+
+void setup() {
+  Serial.begin(9600);
+  while (!Serial); // Espera a que abras el monitor serie
+
+  Serial.println("========================================");
+  Serial.println("Prueba de bateria RTC (Modo Offline)");
+  Serial.println("========================================");
+}
+
+void loop() {
+  if (millis() > printNow) {
+    Serial.print("Hora actual retenida en el RTC: ");
+    Serial.println(getLocaltime());
+    printNow = millis() + printInterval;
+  }
+}
+
+// Función pura para leer la hora interna
+String getLocaltime() {
+  char buffer[32];
+  tm t;
+  _rtc_localtime(time(NULL), &t, RTC_FULL_LEAP_YEAR_SUPPORT);
+  strftime(buffer, 32, "%Y-%m-%d %H:%M:%S", &t);
+  return String(buffer);
+}
+
+
+
+## 3. Solución de Software (El "Parche" LSE)
+
+Por defecto, la librería de Arduino configura el cristal externo de baja velocidad (LSE) con una "capacidad de impulso" baja, lo que causa que el RTC falle y pierda la hora.
+
+**Requisito Obligatorio:** Se debe incluir la siguiente clase al inicio de cualquier sketch que utilice el RTC. Esta clase fuerza al hardware a usar el modo `HIGH_DRIVE`.
+
+```cpp
+// ======================================================================
+// PARCHE DE ESTABILIDAD RTC - GIGA R1
+// ======================================================================
+class FixRTC {
+  public:
+    FixRTC() {
+      // Deshabilita el oscilador para configurarlo
+      LL_RCC_LSE_Disable();
+      // Establece la capacidad de manejo en ALTA (High Drive)
+      LL_RCC_LSE_SetDriveCapability(LL_RCC_LSEDRIVE_HIGH);
+      // Vuelve a habilitar el oscilador estabilizado
+      LL_RCC_LSE_Enable();
+    }
+};
+
+// Instancia prioritaria: Se ejecuta antes que el setup()
+FixRTC fixrtc __attribute__ ((init_priority (101)));
+
+```
+
+---
+
+## 4. Funciones Principales
+
+El sistema se basa en la librería estándar de tiempo de C++ (`time.h`) y las extensiones de Mbed OS (`mbed_mktime.h`).
+
+### A. Librerías Necesarias
+
+```cpp
+#include <mbed_mktime.h>
+
+```
+
+### B. Obtener la Hora (Lectura)
+
+Para leer la hora, convertimos el tiempo *Epoch* (segundos desde 1970) a una estructura legible (`struct tm`).
+
+```cpp
+String getTimestamp() {
+  char buffer[32];
+  tm t;
+  
+  // 1. time(NULL): Obtiene los segundos actuales del RTC.
+  // 2. _rtc_localtime: Convierte esos segundos a estructura de fecha/hora.
+  _rtc_localtime(time(NULL), &t, RTC_FULL_LEAP_YEAR_SUPPORT);
+  
+  // 3. strftime: Formatea la estructura 't' a texto legible.
+  // Formato: AAAA-MM-DD HH:MM:SS
+  strftime(buffer, 32, "%Y-%m-%d %H:%M:%S", &t);
+  
+  return String(buffer);
+}
+
+```
+
+### C. Establecer la Hora (Escritura)
+
+Se utiliza principalmente cuando se sincroniza con internet (NTP) o se ajusta manualmente.
+
+```cpp
+void setManualTime(int year, int month, int day, int hour, int minute, int second) {
+  // Configuración de estructura tm
+  struct tm t = {0};
+  t.tm_year = year - 1900; // Años desde 1900
+  t.tm_mon  = month - 1;   // Meses van de 0 a 11
+  t.tm_mday = day;
+  t.tm_hour = hour;
+  t.tm_min  = minute;
+  t.tm_sec  = second;
+  
+  // Convierte estructura a timestamp Epoch
+  time_t epoch = mktime(&t);
+  
+  // Función de MbedOS para actualizar el hardware del RTC
+  set_time(epoch); 
+}
+
+```
+
+---
+
+## 5. Integración en el Proyecto (Control de Acceso)
+
+Para tu sistema de RF y cerraduras, se recomienda usar el objeto `tm` directamente si necesitas lógica (ej. "No abrir después de las 10 PM"), o el `String` si es solo para logs.
+
+### Ejemplo de uso en lógica de control:
+
+```cpp
+// Variable global para estructura de tiempo
+tm current_time;
+
+void loop() {
+  // Actualizar la estructura con la hora actual
+  _rtc_localtime(time(NULL), &current_time, RTC_FULL_LEAP_YEAR_SUPPORT);
+
+  // Ejemplo: Bloquear acceso entre 11 PM (23:00) y 5 AM (05:00)
+  if (current_time.tm_hour >= 23 || current_time.tm_hour < 5) {
+     Serial.println("ACCESO DENEGADO: Horario restringido.");
+  } else {
+     // Lógica normal de recepción RF
+     verificarCodigosRF(); 
+  }
+}
+
+```
+
+---
+
+## 6. Consideraciones de Zona Horaria (Colombia)
+
+El RTC interno cuenta segundos UTC.
+
+* **Si usas NTP:** Debes restar 18,000 segundos (5 horas) al tiempo recibido antes de llamar a `set_time()`.
+* **Si usas ajuste manual:** Asegúrate de guardar la hora ya calculada para Colombia.
+
+Una vez fijada la hora con el desfase correcto (`UTC -5`), el RTC seguirá contando correctamente en hora local mientras tenga batería.
+
+```
+
+### Siguiente paso sugerido:
+Ya tienes el módulo de tiempo listo. Ahora, lo ideal sería unir este código con tu código de recepción RF.
+
+¿Te gustaría que hagamos un ejemplo de **"Log de eventos"** donde simulemos que llega una señal RF y la imprimimos en el monitor serie junto con su fecha y hora exacta? Así verificaríamos la integración final.
+
+```

@@ -1,0 +1,579 @@
+#include <Adafruit_Fingerprint.h>
+
+// Definición de pines y constantes
+#define SENSOR_SERIAL Serial1
+#define FINGER_DETECT_PIN 9     // Pin de detección de dedo (WAKE UP - Pin 5 del sensor)
+
+// Tiempos de espera (en milisegundos)
+#define TIEMPO_LED_ENCENDIDO 2000  // 2 segundos antes de apagar el LED
+#define LED_FADE_TIME 200       // Tiempo para efectos de LED gradual
+#define LED_FLASH_TIME 100      // Tiempo para efectos de LED parpadeante
+
+// Inicialización del sensor
+Adafruit_Fingerprint finger = Adafruit_Fingerprint(&SENSOR_SERIAL);
+
+// Variables globales
+uint8_t id;                      // ID para almacenar huellas
+volatile bool dedoDetectado = false;  // Flag para interrupción (debe ser volatile)
+bool verificacionAutomatica = true;   // Estado de la verificación automática
+bool procesandoHuella = false;        // Flag para evitar procesamiento múltiple
+
+// Prototipos de funciones
+void mostrarMenu();
+void enrollarHuella();
+void verificarHuellaManual();
+void procesarHuellaInmediata();
+void esperarRetiroDedo();
+void verHuellas();
+void eliminarHuella();
+void cambiarModoVerificacion();
+uint8_t leerNumero();
+uint8_t getFingerprintEnroll();
+uint8_t getFingerprintID();
+uint8_t identificarHuella();
+
+// Función de interrupción para detección de dedo (FALLING porque la lógica está invertida)
+void deteccionDedoISR() {
+  // Solo marcamos como detectado si no estamos ya procesando
+  if (!procesandoHuella && verificacionAutomatica) {
+    dedoDetectado = true;
+  }
+}
+
+void setup() {
+  // Inicialización de comunicación Serial
+  Serial.begin(9600);
+  while (!Serial);
+  
+  Serial.println("\n\n============================");
+  Serial.println(" Sistema de Huellas R503");
+  Serial.println("============================");
+
+  // Configurar el pin de detección como entrada
+  pinMode(FINGER_DETECT_PIN, INPUT);
+  
+  // Inicialización del sensor
+  SENSOR_SERIAL.begin(57600);
+  finger.begin(57600);
+
+  // Verificación de conexión con el sensor
+  if (finger.verifyPassword()) {
+    Serial.println("✓ Sensor de huellas conectado correctamente");
+    Serial.println("Estado del pin WAKE UP: " + String(digitalRead(FINGER_DETECT_PIN) ? "HIGH (sin dedo)" : "LOW (con dedo)"));
+    
+    // LED de inicio - Púrpura parpadeante
+    finger.LEDcontrol(FINGERPRINT_LED_BREATHING, LED_FLASH_TIME, FINGERPRINT_LED_PURPLE);
+    delay(1000);
+    finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, FINGERPRINT_LED_OFF);
+  } else {
+    Serial.println("✗ No se detectó el sensor de huellas");
+    Serial.println("  → Verifique las conexiones y reinicie");
+    while (1) { delay(1); } // Detener ejecución
+  }
+
+  // Configurar interrupción FALLING (cuando pasa de HIGH a LOW - detección de dedo)
+  attachInterrupt(digitalPinToInterrupt(FINGER_DETECT_PIN), deteccionDedoISR, FALLING);
+
+  // Mostrar información inicial
+  finger.getTemplateCount();
+  Serial.print("» Huellas almacenadas: ");
+  Serial.println(finger.templateCount);
+  Serial.println("» Detección automática: ACTIVADA");
+  Serial.println("» Coloque el dedo en el sensor para verificar");
+  
+  mostrarMenu();
+}
+
+void loop() {
+  // Procesamiento de comandos del usuario por Serial
+  if (Serial.available()) {
+    int opcion = Serial.parseInt();
+    
+    switch (opcion) {
+      case 1:
+        enrollarHuella();
+        break;
+      case 2:
+        verificarHuellaManual();
+        break;
+      case 3:
+        verHuellas();
+        break;
+      case 4:
+        eliminarHuella();
+        break;
+      case 5:
+        cambiarModoVerificacion();
+        break;
+      default:
+        if (opcion != 0) { // Evitar mensaje de error en entradas vacías
+          Serial.println("✗ Opción no válida");
+        }
+        break;
+    }
+    mostrarMenu();
+  }
+  
+  // Procesamiento basado en interrupción (eficiente - solo cuando se activa)
+  if (dedoDetectado) {
+    procesandoHuella = true;      // Marcar que estamos procesando
+    dedoDetectado = false;        // Reiniciar el flag de detección
+    
+    // Desactivar temporalmente la interrupción durante el procesamiento
+    detachInterrupt(digitalPinToInterrupt(FINGER_DETECT_PIN));
+    
+    Serial.println("\n» DETECCIÓN DE DEDO - Verificando...");
+    
+    // Verificar la huella
+    procesarHuellaInmediata();
+    
+    // Esperar a que el dedo sea retirado
+    esperarRetiroDedo();
+    
+    // Reactivar la interrupción para próximas detecciones
+    attachInterrupt(digitalPinToInterrupt(FINGER_DETECT_PIN), deteccionDedoISR, FALLING);
+    
+    procesandoHuella = false;     // Marcar que terminamos el procesamiento
+    Serial.println("» Listo para nueva detección");
+    mostrarMenu();
+  }
+  
+  // Este loop es muy liviano - no hace polling constante
+}
+
+//====================== FUNCIONES DEL MENÚ ======================
+
+void mostrarMenu() {
+  Serial.println("\n============================");
+  Serial.println("       MENÚ PRINCIPAL       ");
+  Serial.println("============================");
+  Serial.println("1. Registrar nueva huella");
+  Serial.println("2. Verificar huella manualmente");
+  Serial.println("3. Ver huellas almacenadas");
+  Serial.println("4. Eliminar huella");
+  Serial.println("5. " + String(verificacionAutomatica ? "Desactivar" : "Activar") + " verificación automática");
+  Serial.println("----------------------------");
+  Serial.println("Estado: Verificación automática " + String(verificacionAutomatica ? "ACTIVADA" : "DESACTIVADA"));
+  Serial.println("============================");
+  Serial.print("> ");
+}
+
+uint8_t leerNumero() {
+  uint8_t num = 0;
+  while (num == 0) {
+    while (!Serial.available());
+    num = Serial.parseInt();
+  }
+  return num;
+}
+
+void cambiarModoVerificacion() {
+  verificacionAutomatica = !verificacionAutomatica;
+  
+  if (verificacionAutomatica) {
+    Serial.println("\n» Verificación automática ACTIVADA");
+    Serial.println("» El sistema verificará instantáneamente al detectar un dedo");
+    // Reactivar la interrupción cuando se activa el modo automático
+    attachInterrupt(digitalPinToInterrupt(FINGER_DETECT_PIN), deteccionDedoISR, FALLING);
+    // Indicación visual con LED azul
+    finger.LEDcontrol(FINGERPRINT_LED_FLASHING, LED_FLASH_TIME, FINGERPRINT_LED_BLUE);
+    delay(1000);
+    finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, FINGERPRINT_LED_OFF);
+  } else {
+    Serial.println("\n» Verificación automática DESACTIVADA");
+    Serial.println("» Use la opción 2 del menú para verificar huellas manualmente");
+    // Desactivar la interrupción cuando se desactiva el modo automático
+    detachInterrupt(digitalPinToInterrupt(FINGER_DETECT_PIN));
+    // Indicación visual con LED rojo
+    finger.LEDcontrol(FINGERPRINT_LED_FLASHING, LED_FLASH_TIME, FINGERPRINT_LED_RED);
+    delay(1000);
+    finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, FINGERPRINT_LED_OFF);
+  }
+}
+
+//====================== FUNCIONES PARA HUELLAS ======================
+
+// Función optimizada para identificar huella inmediatamente
+uint8_t identificarHuella() {
+  // Capturar imagen
+  uint8_t p = finger.getImage();
+  if (p != FINGERPRINT_OK) {
+    Serial.println("✗ No se pudo capturar imagen");
+    return 0;
+  }
+
+  // Convertir imagen
+  p = finger.image2Tz();
+  if (p != FINGERPRINT_OK) {
+    Serial.println("✗ No se pudo procesar imagen");
+    return 0;
+  }
+
+  // Buscar coincidencia
+  p = finger.fingerSearch();
+  if (p == FINGERPRINT_OK) {
+    // Devolver el ID de la huella encontrada
+    return finger.fingerID;
+  } 
+  return 0;
+}
+
+// Procesar la huella mientras el dedo está en el sensor
+void procesarHuellaInmediata() {
+  // Encender LED púrpura mientras procesamos
+  finger.LEDcontrol(FINGERPRINT_LED_ON, 0, FINGERPRINT_LED_PURPLE);
+  Serial.println("» Verificando huella mientras el dedo está en el sensor...");
+  
+  // Intentar identificar la huella
+  uint8_t result = identificarHuella();
+  
+  if (result > 0) {
+    // Huella encontrada - Encender LED azul
+    Serial.println("✓ ¡Huella reconocida con éxito!");
+    Serial.print("» ID #"); 
+    Serial.print(result);
+    Serial.print(" (confianza: "); 
+    Serial.print(finger.confidence);
+    Serial.println(")");
+    
+    // LED azul para indicar éxito por 2 segundos
+    finger.LEDcontrol(FINGERPRINT_LED_ON, 0, FINGERPRINT_LED_BLUE);
+    delay(TIEMPO_LED_ENCENDIDO);
+    finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, FINGERPRINT_LED_OFF);
+  } 
+  else {
+    // Huella no reconocida - LED rojo por 2 segundos
+    Serial.println("✗ Huella no reconocida");
+    finger.LEDcontrol(FINGERPRINT_LED_ON, 0, FINGERPRINT_LED_RED);
+    delay(TIEMPO_LED_ENCENDIDO);
+    finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, FINGERPRINT_LED_OFF);
+  }
+}
+
+// Función para esperar hasta que se retire el dedo (usando lógica invertida)
+void esperarRetiroDedo() {
+  // Mostrar puntos mientras esperamos
+  Serial.println("» Por favor, retire el dedo del sensor");
+  
+  // Esperar hasta que el pin vuelva a HIGH (sin dedo)
+  while (digitalRead(FINGER_DETECT_PIN) == LOW) {
+    Serial.print(".");
+    delay(300);
+  }
+  
+  Serial.println("\n» Dedo retirado");
+  delay(300);  // Pequeña pausa para estabilidad
+}
+
+void enrollarHuella() {
+  Serial.println("\n===== REGISTRO DE HUELLA =====");
+  Serial.println("Ingrese ID (1-127) para guardar la huella:");
+  Serial.print("> ");
+  
+  id = leerNumero();
+  if (id == 0) {
+    Serial.println("✗ Operación cancelada");
+    return;
+  }
+  
+  Serial.print("» Registrando ID #");
+  Serial.println(id);
+
+  while (!getFingerprintEnroll());
+}
+
+uint8_t getFingerprintEnroll() {
+  int p = -1;
+  
+  // LED azul - esperando primera huella
+  finger.LEDcontrol(FINGERPRINT_LED_ON, LED_FLASH_TIME, FINGERPRINT_LED_BLUE);
+  
+  Serial.println("» Coloque el dedo en el sensor...");
+  while (p != FINGERPRINT_OK) {
+    p = finger.getImage();
+    switch (p) {
+    case FINGERPRINT_OK:
+      Serial.println("✓ Imagen capturada");
+      finger.LEDcontrol(FINGERPRINT_LED_FLASHING, LED_FLASH_TIME, FINGERPRINT_LED_BLUE);
+      break;
+    case FINGERPRINT_NOFINGER:
+      Serial.print(".");
+      break;
+    case FINGERPRINT_PACKETRECIEVEERR:
+      Serial.println("✗ Error de comunicación");
+      break;
+    case FINGERPRINT_IMAGEFAIL:
+      Serial.println("✗ Error de imagen");
+      break;
+    default:
+      Serial.println("✗ Error desconocido");
+      break;
+    }
+  }
+
+  p = finger.image2Tz(1);
+  switch (p) {
+    case FINGERPRINT_OK:
+      Serial.println("✓ Imagen convertida");
+      break;
+    case FINGERPRINT_IMAGEMESS:
+      Serial.println("✗ Imagen demasiado borrosa");
+      return p;
+    case FINGERPRINT_PACKETRECIEVEERR:
+      Serial.println("✗ Error de comunicación");
+      return p;
+    case FINGERPRINT_FEATUREFAIL:
+      Serial.println("✗ No se encontraron características");
+      return p;
+    case FINGERPRINT_INVALIDIMAGE:
+      Serial.println("✗ Imagen inválida");
+      return p;
+    default:
+      Serial.println("✗ Error desconocido");
+      return p;
+  }
+
+  Serial.println("» Retire el dedo del sensor");
+  finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, FINGERPRINT_LED_OFF);
+  delay(2000);
+  p = 0;
+  while (p != FINGERPRINT_NOFINGER) {
+    p = finger.getImage();
+  }
+
+  // LED azul - esperando segunda huella
+  finger.LEDcontrol(FINGERPRINT_LED_ON, LED_FLASH_TIME, FINGERPRINT_LED_BLUE);
+  Serial.println("» Coloque el mismo dedo nuevamente");
+  p = -1;
+  while (p != FINGERPRINT_OK) {
+    p = finger.getImage();
+    switch (p) {
+    case FINGERPRINT_OK:
+      Serial.println("✓ Imagen capturada");
+      finger.LEDcontrol(FINGERPRINT_LED_FLASHING, LED_FLASH_TIME, FINGERPRINT_LED_BLUE);
+      break;
+    case FINGERPRINT_NOFINGER:
+      Serial.print(".");
+      break;
+    case FINGERPRINT_PACKETRECIEVEERR:
+      Serial.println("✗ Error de comunicación");
+      break;
+    case FINGERPRINT_IMAGEFAIL:
+      Serial.println("✗ Error de imagen");
+      break;
+    default:
+      Serial.println("✗ Error desconocido");
+      break;
+    }
+  }
+
+  p = finger.image2Tz(2);
+  switch (p) {
+    case FINGERPRINT_OK:
+      Serial.println("✓ Imagen convertida");
+      break;
+    case FINGERPRINT_IMAGEMESS:
+      Serial.println("✗ Imagen demasiado borrosa");
+      return p;
+    case FINGERPRINT_PACKETRECIEVEERR:
+      Serial.println("✗ Error de comunicación");
+      return p;
+    case FINGERPRINT_FEATUREFAIL:
+      Serial.println("✗ No se encontraron características");
+      return p;
+    case FINGERPRINT_INVALIDIMAGE:
+      Serial.println("✗ Imagen inválida");
+      return p;
+    default:
+      Serial.println("✗ Error desconocido");
+      return p;
+  }
+
+  Serial.print("» Creando modelo para ID #");
+  Serial.println(id);
+
+  p = finger.createModel();
+  if (p == FINGERPRINT_OK) {
+    Serial.println("✓ ¡Las huellas coinciden!");
+    finger.LEDcontrol(FINGERPRINT_LED_GRADUAL_ON, LED_FADE_TIME, FINGERPRINT_LED_BLUE);
+  } else if (p == FINGERPRINT_PACKETRECIEVEERR) {
+    Serial.println("✗ Error de comunicación");
+    finger.LEDcontrol(FINGERPRINT_LED_GRADUAL_ON, LED_FADE_TIME, FINGERPRINT_LED_RED);
+    return p;
+  } else if (p == FINGERPRINT_ENROLLMISMATCH) {
+    Serial.println("✗ Las huellas no coinciden");
+    finger.LEDcontrol(FINGERPRINT_LED_GRADUAL_ON, LED_FADE_TIME, FINGERPRINT_LED_RED);
+    return p;
+  } else {
+    Serial.println("✗ Error desconocido");
+    finger.LEDcontrol(FINGERPRINT_LED_GRADUAL_ON, LED_FADE_TIME, FINGERPRINT_LED_RED);
+    return p;
+  }
+
+  p = finger.storeModel(id);
+  if (p == FINGERPRINT_OK) {
+    Serial.println("✓ ¡Huella almacenada con éxito!");
+    finger.LEDcontrol(FINGERPRINT_LED_GRADUAL_OFF, LED_FADE_TIME, FINGERPRINT_LED_PURPLE);
+  } else if (p == FINGERPRINT_PACKETRECIEVEERR) {
+    Serial.println("✗ Error de comunicación");
+    return p;
+  } else if (p == FINGERPRINT_BADLOCATION) {
+    Serial.println("✗ No se pudo almacenar en esa ubicación");
+    return p;
+  } else if (p == FINGERPRINT_FLASHERR) {
+    Serial.println("✗ Error escribiendo en memoria flash");
+    return p;
+  } else {
+    Serial.println("✗ Error desconocido");
+    return p;
+  }
+  
+  delay(1000);
+  finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, FINGERPRINT_LED_OFF);
+  return true;
+}
+
+void verificarHuellaManual() {
+  finger.LEDcontrol(FINGERPRINT_LED_ON, LED_FLASH_TIME, FINGERPRINT_LED_PURPLE);
+  Serial.println("\n===== VERIFICACIÓN MANUAL =====");
+  Serial.println("» Tienes 5 segundos para colocar el dedo...");
+  
+  unsigned long startTime = millis();
+  bool huella_encontrada = false;
+  
+  while ((millis() - startTime) < 5000 && !huella_encontrada) {
+    uint8_t result = getFingerprintID();
+    if (result != FINGERPRINT_NOFINGER && result > 0) {
+      huella_encontrada = true;
+    }
+    delay(50);
+  }
+  
+  if (!huella_encontrada) {
+    Serial.println("✗ Tiempo agotado. No se detectó huella.");
+    finger.LEDcontrol(FINGERPRINT_LED_GRADUAL_ON, LED_FADE_TIME, FINGERPRINT_LED_RED);
+    delay(1000);
+    finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, FINGERPRINT_LED_OFF);
+  }
+}
+
+uint8_t getFingerprintID() {
+  uint8_t p = finger.getImage();
+  switch (p) {
+    case FINGERPRINT_OK:
+      Serial.println("✓ Imagen capturada");
+      break;
+    case FINGERPRINT_NOFINGER:
+      return p;
+    case FINGERPRINT_PACKETRECIEVEERR:
+      Serial.println("✗ Error de comunicación");
+      return p;
+    case FINGERPRINT_IMAGEFAIL:
+      Serial.println("✗ Error de imagen");
+      return p;
+    default:
+      Serial.println("✗ Error desconocido");
+      return p;
+  }
+
+  p = finger.image2Tz();
+  switch (p) {
+    case FINGERPRINT_OK:
+      Serial.println("✓ Imagen convertida");
+      break;
+    case FINGERPRINT_IMAGEMESS:
+      Serial.println("✗ Imagen demasiado borrosa");
+      return p;
+    case FINGERPRINT_PACKETRECIEVEERR:
+      Serial.println("✗ Error de comunicación");
+      return p;
+    case FINGERPRINT_FEATUREFAIL:
+      Serial.println("✗ No se encontraron características");
+      return p;
+    case FINGERPRINT_INVALIDIMAGE:
+      Serial.println("✗ Imagen inválida");
+      return p;
+    default:
+      Serial.println("✗ Error desconocido");
+      return p;
+  }
+
+  p = finger.fingerSearch();
+  if (p == FINGERPRINT_OK) {
+    Serial.println("✓ ¡Huella encontrada!");
+    Serial.print("» ID #"); 
+    Serial.print(finger.fingerID);
+    Serial.print(" (confianza: "); 
+    Serial.print(finger.confidence);
+    Serial.println(")");
+    
+    finger.LEDcontrol(FINGERPRINT_LED_GRADUAL_ON, LED_FADE_TIME, FINGERPRINT_LED_BLUE);
+    delay(2000);
+    finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, FINGERPRINT_LED_OFF);
+    
+    return finger.fingerID;
+  } else if (p == FINGERPRINT_PACKETRECIEVEERR) {
+    Serial.println("✗ Error de comunicación");
+    finger.LEDcontrol(FINGERPRINT_LED_GRADUAL_ON, LED_FADE_TIME, FINGERPRINT_LED_RED);
+    return p;
+  } else if (p == FINGERPRINT_NOTFOUND) {
+    Serial.println("✗ Huella no reconocida");
+    finger.LEDcontrol(FINGERPRINT_LED_GRADUAL_ON, LED_FADE_TIME, FINGERPRINT_LED_RED);
+    return p;
+  } else {
+    Serial.println("✗ Error desconocido");
+    finger.LEDcontrol(FINGERPRINT_LED_GRADUAL_ON, LED_FADE_TIME, FINGERPRINT_LED_RED);
+    return p;
+  }
+}
+
+void verHuellas() {
+  Serial.println("\n===== HUELLAS ALMACENADAS =====");
+  finger.getTemplateCount();
+  
+  if (finger.templateCount == 0) {
+    Serial.println("» No hay huellas almacenadas");
+  } else {
+    Serial.print("» Total: "); 
+    Serial.print(finger.templateCount); 
+    Serial.println(" huellas");
+  }
+  
+  // LED azul parpadeante mientras muestra la información
+  finger.LEDcontrol(FINGERPRINT_LED_BREATHING, LED_FLASH_TIME, FINGERPRINT_LED_BLUE);
+  delay(2000);
+  finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, FINGERPRINT_LED_OFF);
+}
+
+void eliminarHuella() {
+  Serial.println("\n===== ELIMINAR HUELLA =====");
+  Serial.println("Ingrese ID (1-127) a eliminar:");
+  Serial.print("> ");
+  
+  uint8_t id = leerNumero();
+  if (id == 0) {
+    Serial.println("✗ Operación cancelada");
+    return;
+  }
+
+  Serial.print("» Eliminando ID #");
+  Serial.println(id);
+  
+  finger.LEDcontrol(FINGERPRINT_LED_FLASHING, LED_FLASH_TIME, FINGERPRINT_LED_RED);
+  
+  uint8_t p = finger.deleteModel(id);
+  if (p == FINGERPRINT_OK) {
+    Serial.println("✓ ¡Huella eliminada con éxito!");
+    finger.LEDcontrol(FINGERPRINT_LED_GRADUAL_OFF, LED_FADE_TIME, FINGERPRINT_LED_PURPLE);
+  } else if (p == FINGERPRINT_PACKETRECIEVEERR) {
+    Serial.println("✗ Error de comunicación");
+  } else if (p == FINGERPRINT_BADLOCATION) {
+    Serial.println("✗ ID no válido");
+  } else if (p == FINGERPRINT_FLASHERR) {
+    Serial.println("✗ Error escribiendo en memoria flash");
+  } else {
+    Serial.println("✗ Error desconocido");
+  }
+  delay(1000);
+  finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, FINGERPRINT_LED_OFF);
+}

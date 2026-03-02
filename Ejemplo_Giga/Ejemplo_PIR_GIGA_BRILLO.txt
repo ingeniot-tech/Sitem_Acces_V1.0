@@ -1,0 +1,72 @@
+#include <mbed.h>
+#include <Arduino_GigaDisplay.h>
+
+GigaDisplayBacklight backlight;
+
+// Objetos Ticker
+mbed::Ticker apagarBrilloTicker;  // Ticker para programar la reducción de brillo
+
+// Configuración del sensor PIR
+const byte PIR_PIN = A2;  // Pin del sensor de movimiento
+volatile bool movimientoDetectado = false;
+volatile bool brilloAltoActivo = false;
+
+// Constantes de brillo
+const uint8_t BRILLO_BAJO = 10;   // Brillo al 10%
+const uint8_t BRILLO_ALTO = 100;  // Brillo al 100%
+
+// Función para reducir el brillo después del tiempo establecido
+void reducirBrillo() {
+    // Reduce el brillo de la pantalla al nivel bajo
+    backlight.set(BRILLO_BAJO);
+    brilloAltoActivo = false;
+    
+    // Desvincula el ticker para que no se ejecute repetidamente
+    apagarBrilloTicker.detach();
+    
+   // Serial.println("Brillo reducido al 10%");
+}
+
+// Función de interrupción que se ejecuta cuando se detecta movimiento
+void deteccionMovimiento() {
+    // Solo procede si el brillo alto no está ya activo
+    if (!brilloAltoActivo) {
+        // Aumenta el brillo de la pantalla al nivel alto
+        backlight.set(BRILLO_ALTO);
+        brilloAltoActivo = true;
+        
+        //Serial.println("¡Movimiento detectado! Brillo aumentado al 100%");
+        
+        // Programa la reducción del brillo después de 5 segundos
+        apagarBrilloTicker.attach(&reducirBrillo, 30.0);
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    delay(2000); // Tiempo para que se conecte el puerto serial
+    
+    // Inicialización de la retroiluminación
+    backlight.begin();
+    backlight.set(BRILLO_BAJO); // Comienza con brillo bajo
+    
+    // Configuración del pin del sensor de movimiento
+    pinMode(PIR_PIN, INPUT);
+    
+    // También configuramos el LED integrado para visualización (opcional)
+    pinMode(LED_BUILTIN, OUTPUT);
+    digitalWrite(LED_BUILTIN, LOW);
+    
+    // Configura la interrupción para detectar movimiento
+    attachInterrupt(digitalPinToInterrupt(PIR_PIN), deteccionMovimiento, RISING);
+
+    Serial.println("Sistema de control de brillo inicializado:");
+    Serial.println("- Al detectar movimiento, el brillo aumentará al 100%");
+    Serial.println("- Después de 5 segundos, el brillo volverá al 10%");
+    Serial.println("Sistema listo.");
+}
+
+void loop() {
+    // El bucle principal permanece vacío ya que las interrupciones y los tickers 
+    // manejan toda la sincronización
+}

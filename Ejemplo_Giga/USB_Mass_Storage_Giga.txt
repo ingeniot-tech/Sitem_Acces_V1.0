@@ -1,0 +1,422 @@
+USB Mass Storage
+The USB-A connector onboard the GIGA R1 can be used to connect USB mass storage devices, for example, a USB stick. This can be used for a number of applications, including:
+
+Accessing large files such as images & audio files,
+Logging large amounts of data,
+Storing images or videos captured with a camera.
+USB mass storage devices connected needs to be formatted with the FAT32 as a file system, using the MBR partitioning scheme. This is a requirement, and reading & writing will not work otherwise.
+
+The USB mass storage features are based on the Arduino_USBHostMbed5 library.
+
+USB Designation
+To access the correct USB mass storage device, we need to specify the designation in the code.
+
+mbed::FATFileSystem usb("USB_DRIVE_DESIGNATION")
+
+This is so that our GIGA R1 can target the right USB device. In addition, when reading & writing to files, please ensure that the designation is included in the path.
+
+The below line of code is an example of how you need to use the designation in the path, /usb/ before accessing the file.
+
+FILE *f = fopen("/usb/text.txt", "r+");
+
+List File Directory
+Below is an example sketch that can be used to list files in a USB mass storage device.
+
+#include <DigitalOut.h>
+#include <FATFileSystem.h>
+#include <Arduino_USBHostMbed5.h>
+
+USBHostMSD msd;
+mbed::FATFileSystem usb("usb");
+
+
+void setup()
+{
+    Serial.begin(115200);
+    
+    pinMode(PA_15, OUTPUT); //enable the USB-A port
+    digitalWrite(PA_15, HIGH);
+    
+    while (!Serial)
+        ;
+
+    Serial.println("Starting USB Dir List example...");
+
+    // if you are using a Max Carrier uncomment the following line
+    // start_hub();
+
+    while (!msd.connect()) {
+        //while (!port.connected()) {
+        delay(1000);
+    }
+
+    Serial.print("Mounting USB device... ");
+    int err = usb.mount(&msd);
+    if (err) {
+        Serial.print("Error mounting USB device ");
+        Serial.println(err);
+        while (1);
+    }
+    Serial.println("done.");
+
+    char buf[256];
+
+    // Display the root directory
+    Serial.print("Opening the root directory... ");
+    DIR* d = opendir("/usb/");
+    Serial.println(!d ? "Fail :(" : "Done");
+    if (!d) {
+        snprintf(buf, sizeof(buf), "error: %s (%d)\r\n", strerror(errno), -errno);
+        Serial.print(buf);
+    }
+    Serial.println("done.");
+
+    Serial.println("Root directory:");
+    unsigned int count { 0 };
+    while (true) {
+        struct dirent* e = readdir(d);
+        if (!e) {
+            break;
+        }
+        count++;
+        snprintf(buf, sizeof(buf), "    %s\r\n", e->d_name);
+        Serial.print(buf);
+    }
+    Serial.print(count);
+    Serial.println(" files found!");
+
+    snprintf(buf, sizeof(buf), "Closing the root directory... ");
+    Serial.print(buf);
+    fflush(stdout);
+    err = closedir(d);
+    snprintf(buf, sizeof(buf), "%s\r\n", (err < 0 ? "Fail :(" : "OK"));
+    Serial.print(buf);
+    if (err < 0) {
+        snprintf(buf, sizeof(buf), "error: %s (%d)\r\n", strerror(errno), -errno);
+        Serial.print(buf);
+    }
+}
+
+void loop()
+{
+}
+
+File Read
+Below is an example sketch that can be used to read files from a USB mass storage device.
+
+#include <Arduino_USBHostMbed5.h>
+#include <DigitalOut.h>
+#include <FATFileSystem.h>
+
+USBHostMSD msd;
+mbed::FATFileSystem usb("usb");
+
+// If you are using a Portenta Machine Control uncomment the following line
+mbed::DigitalOut otg(PB_14, 0);
+ 
+void setup() {
+  Serial.begin(115200);
+  
+  pinMode(PA_15, OUTPUT); //enable the USB-A port
+  digitalWrite(PA_15, HIGH);  
+  
+  while (!Serial);
+
+  delay(2500);
+  Serial.println("Starting USB File Read example...");
+
+  // if you are using a Max Carrier uncomment the following line
+  //start_hub();
+
+  while (!msd.connect()) {
+    delay(1000);
+  }
+
+  Serial.println("Mounting USB device...");
+  int err =  usb.mount(&msd);
+  if (err) {
+    Serial.print("Error mounting USB device ");
+    Serial.println(err);
+    while (1);
+  }
+  Serial.print("read done ");
+  mbed::fs_file_t file;
+  struct dirent *ent;
+  int dirIndex = 0;
+  int res = 0;
+  Serial.println("Open file..");
+  FILE *f = fopen("/usb/Arduino.txt", "r+");
+  char buf[256];
+  Serial.println("File content:");
+
+  while (fgets(buf, 256, f) != NULL) {
+    Serial.print(buf);
+  }
+
+  Serial.println("File closing");
+  fflush(stdout);
+  err = fclose(f);
+  if (err < 0) {
+    Serial.print("fclose error:");
+    Serial.print(strerror(errno));
+    Serial.print(" (");
+    Serial.print(-errno);
+    Serial.print(")");
+  } else {
+    Serial.println("File closed");
+  }
+}
+
+void loop() {
+
+}
+
+
+File Write
+Below is an example sketch that can be used to write files from a USB mass storage device.
+
+#include <Arduino_USBHostMbed5.h>
+#include <DigitalOut.h>
+#include <FATFileSystem.h>
+
+USBHostMSD msd;
+mbed::FATFileSystem usb("usb");
+
+// mbed::DigitalOut pin5(PC_6, 0);
+mbed::DigitalOut otg(PB_8, 1);
+
+void setup() {
+  Serial.begin(115200);
+  
+  pinMode(PA_15, OUTPUT); //enable the USB-A port
+  digitalWrite(PA_15, HIGH);
+  
+  while (!Serial);
+  
+  msd.connect();
+
+  while (!msd.connect()) {
+    //while (!port.connected()) {
+    delay(1000);
+  }
+
+  Serial.println("Mounting USB device...");
+  int err =  usb.mount(&msd);
+  if (err) {
+    Serial.print("Error mounting USB device ");
+    Serial.println(err);
+    while (1);
+  }
+  Serial.print("read done ");
+  mbed::fs_file_t file;
+  struct dirent *ent;
+  int dirIndex = 0;
+  int res = 0;
+  Serial.println("Open /usb/numbers.txt");
+  FILE *f = fopen("/usb/numbers.txt", "w+");
+  for (int i = 0; i < 10; i++) {
+    Serial.print("Writing numbers (");
+    Serial.print(i);
+    Serial.println("/10)");
+    fflush(stdout);
+    err = fprintf(f, "%d\n", i);
+    if (err < 0) {
+      Serial.println("Fail :(");
+      error("error: %s (%d)\n", strerror(errno), -errno);
+    }
+  }
+
+  Serial.println("File closing");
+  fflush(stdout);
+  err = fclose(f);
+  if (err < 0) {
+    Serial.print("fclose error:");
+    Serial.print(strerror(errno));
+    Serial.print(" (");
+    Serial.print(-errno);
+    Serial.print(")");
+  } else {
+    Serial.println("File closed");
+  }
+}
+
+void loop() {
+
+}
+
+Datalogger Example
+In the example below, we are reading logging the A0 pin, where we are defining two parameters:
+
+interval - how long between each reading.
+number_of_readings - how many readings we should take.
+This is useful if you e.g. want to log a specific amount of samples for a specific amount of time.
+
+#include <Arduino_USBHostMbed5.h>
+#include <DigitalOut.h>
+#include <FATFileSystem.h>
+
+USBHostMSD msd;
+mbed::FATFileSystem usb("usb");
+
+int err;
+int count;
+int number_of_readings = 100; //how many readings you want to take
+int interval = 10; //how long between readings (milliseconds)
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(PA_15, OUTPUT);  //enable the USB-A port
+  digitalWrite(PA_15, HIGH);
+
+  while (!Serial); //stop program from executing until serial port opens
+
+  msd.connect();
+
+  while (!msd.connect()) {
+    Serial.print("MSD not found.");
+    delay(1000);
+  }
+
+  Serial.println("Mounting USB device...");
+
+  err = usb.mount(&msd);
+  if (err) {
+    Serial.print("Error mounting USB device ");
+    Serial.println(err);
+    while (1)
+      ;
+  }
+  Serial.print("read done ");
+  
+  //function to write to file
+  WriteToFile();
+}
+
+void loop() {
+}
+
+void WriteToFile() {
+  mbed::fs_file_t file;
+  struct dirent *ent;
+  int dirIndex = 0;
+  int res = 0;
+
+  Serial.println("Opening file..");
+  FILE *f = fopen("/usb/log.txt", "w+");
+
+  for (int i = 0; i < number_of_readings; i++) {
+    count += 1;
+
+    Serial.print("Reading Nr: ");
+    Serial.print(count);
+    Serial.print(", Value: ");
+    Serial.println(analogRead(A0));
+    
+    fflush(stdout);
+    
+    int reading = analogRead(A0);
+
+    err = fprintf(f, "%s", "Reading Nr: ");
+    err = fprintf(f, "%d", count);
+    err = fprintf(f, "%s", ", Value: ");
+    err = fprintf(f, "%d\n", reading);
+
+    if (err < 0) {
+      Serial.println("Fail :(");
+      error("error: %s (%d)\n", strerror(errno), -errno);
+    }
+    delay(interval);
+  }
+
+  Serial.println("File closing");
+  fflush(stdout);
+  err = fclose(f);
+
+  if (err < 0) {
+    Serial.print("fclose error:");
+    Serial.print(strerror(errno));
+    Serial.print(" (");
+    Serial.print(-errno);
+    Serial.print(")");
+  } else {
+    Serial.println("File closed");
+  }
+}
+
+After logging data, remove the USB stick from your board, and insert it in your computer to see the data logged:
+
+USB Host Keyboard
+It is possible to connect generic USB keyboards to the GIGA R1's USB-A connector without any additional circuitry.
+
+The library used for this can be downloaded through Github.
+
+USBHostGiga
+Please note that this library is in Alpha development stage. This means support is experimental and examples may not function as expected. Future versions of this library may break the example provided below.
+
+#include "USBHostGiga.h"
+
+//REDIRECT_STDOUT_TO(Serial)
+Keyboard keyb;
+HostSerial ser;
+
+void setup() {
+  // put your setup code here, to run once:
+  Serial.begin(115200);
+  while (!Serial);
+  pinMode(PA_15, OUTPUT);
+  keyb.begin();
+  ser.begin();
+}
+
+
+void loop() {
+  if (keyb.available()) {
+    auto _key = keyb.read();
+    Serial.println(keyb.getAscii(_key));
+  }
+  while (ser.available()) {
+    auto _char = ser.read();
+    Serial.write(_char);
+  }
+  //delay(1);
+}
+
+
+USB HID
+It is possible to turn your GIGA R1 board into a Human Interface Device (HID), aka mouse & keyboard, using the USBHID library which is included in the GIGA Board Package.
+
+Among other things, you can:
+
+Create a custom keyboard, or a keyboard accessory,
+Create sophisticated game controllers,
+Accessories for VR/AR applications.
+
+To emulate a keyboard, we need to include PluggableUSBHID.h and USBKeyboard.h, and create an object using the USBkeyboard constructor.
+
+#include "PluggableUSBHID.h"
+#include "USBKeyboard.h"
+
+USBKeyboard Keyboard;
+
+To send a single character, we can use the putc() method.
+
+Keyboard.putc(97); //prints the letter 'a'
+
+See the DEC column at ascii-code.com to understand what number you need to print a specific character.
+
+To print a whole string, use the printf() method.
+
+Keyboard.printf("Hello World!");
+
+
+To use modifiers and function keys, use the key_code() method.
+
+Keyboard.key_code(KEY_F1);
+
+To use media keys, use the media_control() method.
+
+Keyboard.media_control(KEY_NEXT_TRACK);
+
+
+

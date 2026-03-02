@@ -1,0 +1,2568 @@
+/*
+  Giga_Casa.ino
+  Integracion incremental para Arduino GIGA R1 WiFi:
+  - Arduino Cloud (chat, notification, led2)
+  - Sensor de huella R503 por UART en Serial2 (RX1/TX1 -> pines 19/18)
+  - Modulo MP3 por UART en Serial3 (RX2/TX2 -> pines 17/16)
+  - Pantalla ST7565 128x64 con fecha/hora RTC + estado WiFi
+  - Boton de salida (pin 3) + botones externos (26/28/30/32) con antirrebote Bounce2
+
+  Nota:
+  - Los usuarios se guardan en QSPI (particion usuario MBR #4, LittleFS).
+  - Se mantienen los mismos numeros de pista del Example_code.h.
+*/
+
+#include <Arduino.h>
+#include <U8g2lib.h>
+#include <Adafruit_Fingerprint.h>
+#include <WiFi.h>
+#include <Bounce2.h>
+#include <ctype.h>
+#include <time.h>
+#include <string.h>
+#include <BlockDevice.h>
+#include <MBRBlockDevice.h>
+#include <LittleFileSystem.h>
+#include <mbed_mktime.h>
+
+#if defined(__has_include)
+  #if __has_include(<stm32h7xx_ll_rcc.h>)
+    #include <stm32h7xx_ll_rcc.h>
+    #define GIGA_HAS_LL_RCC 1
+  #endif
+#endif
+
+#include "thingProperties.h"
+
+// -------------------- Parche RTC GIGA R1 --------------------
+#if defined(GIGA_HAS_LL_RCC)
+class FixRTC {
+ public:
+  FixRTC() {
+    LL_RCC_LSE_Disable();
+    LL_RCC_LSE_SetDriveCapability(LL_RCC_LSEDRIVE_HIGH);
+    LL_RCC_LSE_Enable();
+  }
+};
+FixRTC fixrtc __attribute__((init_priority(101)));
+#endif
+
+// -------------------- UART hardware --------------------
+#define SENSOR_SERIAL Serial2  // R503: RX1/TX1 -> pines 19/18
+#define MP3_SERIAL Serial3     // MP3 : RX2/TX2 -> pines 17/16
+
+// -------------------- LCD ST7565 --------------------
+static const uint8_t LCD_CONTRAST = 65;
+
+static const uint8_t PIN_LCD_SCK = 13;
+static const uint8_t PIN_LCD_MOSI = 11;
+static const uint8_t PIN_LCD_CS = 10;
+static const uint8_t PIN_LCD_DC = 9;
+static const uint8_t PIN_LCD_RESET = 8;
+static const uint8_t LCD_INIT_RETRIES = 3;
+static const uint32_t LCD_STARTUP_WAKE_MS = 15000;
+static const uint32_t LCD_POST_BOOT_REINIT_DELAY_MS = 2500;
+
+// -------------------- Puerta / boton salida --------------------
+static const uint8_t PIN_RELAY = 5;
+static const uint8_t PIN_BOTON_SALIDA = 3;
+static const uint8_t PIN_LED_BOTON_SALIDA = 6;
+static const uint8_t PIN_BOTON_EXT_1 = 26;
+static const uint8_t PIN_BOTON_EXT_2 = 28;
+static const uint8_t PIN_BOTON_EXT_3 = 30;
+static const uint8_t PIN_BOTON_EXT_4 = 32;
+static const uint8_t PIN_LCD_BACKLIGHT = 7;  // Pin A del display (backlight)
+static const bool RELAY_ACTIVE_LOW = false;
+static const bool LED_BOTON_ACTIVE_HIGH = true;
+static const bool LCD_BACKLIGHT_ACTIVE_HIGH = true;
+static const uint32_t RELAY_OPEN_MS = 4000;
+static const uint32_t BTN_DEBOUNCE_MS = 200;
+static const uint32_t BTN_EXT_DEBOUNCE_MS = 120;
+static const uint32_t DISPLAY_WAKE_HOLD_MS = 40000;        // 40 segundos
+static const uint16_t MEDIUM_BLOCK_START_MIN = 15;         // 00:15
+static const uint16_t MEDIUM_BLOCK_END_MIN = 300;          // 05:00
+
+// Timers de sistema
+static const uint32_t LCD_REFRESH_MS = 500;
+static const uint32_t LCD_HEALTH_KICK_MS = 30000UL;              // "keep-alive" LCD cada 30 s
+static const uint32_t LCD_RESET_LOW_MS = 40;
+static const uint32_t LCD_RESET_HIGH_MS = 60;
+static const uint32_t RTC_POLL_MS = 1000;
+static const uint32_t RTC_RESYNC_INTERVAL_MS = 21600000UL;      // 6 horas
+static const uint32_t RTC_RESYNC_RETRY_MS = 60000UL;            // 1 minuto
+static const uint32_t CLOUD_RECONNECT_INTERVAL_MS = 270000UL;   // 4.5 minutos
+static const uint32_t CLOUD_UPDATE_OFFLINE_MS = 15000UL;        // Cloud down pero WiFi up
+static const uint32_t CLOUD_UPDATE_ONLINE_MS = 120UL;           // Cloud estable
+static const uint8_t WIFI_RETRY_BURST_ATTEMPTS = 3;
+static const uint32_t WIFI_RETRY_GAP_MS = 600;
+static const uint32_t WIFI_RETRY_SETTLE_MS = 7000;
+static const uint8_t CLOUD_RETRY_BURST_ATTEMPTS = 2;
+static const uint32_t CLOUD_RETRY_GAP_MS = 400;
+static const uint32_t CLOUD_RETRY_SETTLE_MS = 3000;
+static const uint8_t WIFI_BOOT_RETRY_ATTEMPTS = 4;
+static const uint32_t WIFI_BOOT_RETRY_SETTLE_MS = 9000;
+static const uint8_t CLOUD_BOOT_RETRY_ATTEMPTS = 3;
+static const uint32_t CLOUD_BOOT_RETRY_SETTLE_MS = 4500;
+static const int32_t RTC_UTC_OFFSET_SECONDS = -5 * 3600;        // Colombia UTC-5
+
+// Buffer completo para render estable en ST7565.
+U8G2_ST7565_ERC12864_ALT_F_4W_SW_SPI u8g2(
+  U8G2_R0,
+  PIN_LCD_SCK,
+  PIN_LCD_MOSI,
+  PIN_LCD_CS,
+  PIN_LCD_DC,
+  PIN_LCD_RESET
+);
+
+// -------------------- Audio (mismos IDs del Example_code.h) --------------------
+#define VOLUMEN_INICIAL 30
+#define VOLUMEN_MAX 30
+
+#define AUDIO_INGRESO_EXITOSO 15
+#define AUDIO_SALIDA_EXITOSO 15
+#define AUDIO_INGRESO_FALLIDO 54
+#define AUDIO_SALIDA_FALLIDO 24 //30
+#define AUDIO_HUELLA_NO 24 //30
+#define AUDIO_HUELLA_SI 54 //6
+#define AUDIO_USER_DELETE 53 //21
+#define AUDIO_USER_ADD 54 //22
+#define AUDIO_CONFIRT_DATA 2 //23
+#define AUDIO_ALARMA_DOOR 2 //24
+#define AUDIO_TIMBRE 2 // 58
+#define AUDIO_BIENVENIDA 54 
+#define AUDIO_COLOQUE_DEDO 2 //8
+#define AUDIO_RETIRE_DEDO 3 //9
+#define AUDIO_COLOQUE_DEDO2 4 //10
+#define AUDIO_EXITO 20 //26 0 16
+#define AUDIO_ERROR 1 //7
+#define AUDIO_ABRIENDO_PUERTA 15 //21
+#define AUDIO_CERRANDO_PUERTA 16 //22
+#define CLAVE_CORRECTA  18 //24
+#define CLAVE_INCORRECTA 19 //25
+//#define USER_DELATE 53  //59
+//#define USER_ADD 54 // 60
+
+// -------------------- Usuarios --------------------
+#define MAX_USUARIOS_EN_MEMORIA 50
+#define NOMBRE_MAX_LENGTH 31
+#define DOCUMENTO_MAX_LENGTH 13
+#define TELEFONO_MAX_LENGTH 13
+#define FECHA_NACIMIENTO_LENGTH 11
+
+#define TIMEOUT_OPERACION_HUELLA 15000
+#define MAX_REINTENTOS_REGISTRO 3
+#define CLOUD_SESSION_TIMEOUT_MS 120000
+#define FINGER_POLL_INTERVAL_MS 120
+#define FINGER_RELEASE_GUARD_MS 2000
+
+struct DatosUsuario {
+  char nombre[NOMBRE_MAX_LENGTH];
+  char documento[DOCUMENTO_MAX_LENGTH];
+  char telefono[TELEFONO_MAX_LENGTH];
+  char fechaNacimiento[FECHA_NACIMIENTO_LENGTH];
+  uint8_t idHuella;
+  bool activo;
+};
+
+struct UsersDbHeader {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t structSize;
+  uint16_t totalSlots;
+};
+
+struct SecurityConfigRecord {
+  uint32_t magic;
+  uint16_t version;
+  uint8_t securityLevel;
+  uint8_t reserved;
+};
+
+enum SystemState {
+  IDLE,
+  MAIN_MENU_AWAITING_CHOICE,
+
+  ADD_USER_AWAITING_NAME,
+  ADD_USER_AWAITING_DOCUMENT,
+  ADD_USER_AWAITING_PHONE,
+  ADD_USER_AWAITING_BIRTHDATE,
+  ADD_USER_INITIATE_FINGERPRINT,
+  ADD_USER_PROCESSING_FINGERPRINT,
+
+  DELETE_USER_AWAITING_IDENTIFIER,
+  DELETE_USER_CONFIRMING,
+  DELETE_USER_PROCESSING,
+
+  ADJUST_VOLUME_AWAITING_LEVEL,
+  ADJUST_SECURITY_AWAITING_LEVEL
+};
+
+enum FingerScanResult {
+  FINGER_SCAN_NONE,
+  FINGER_SCAN_MATCH,
+  FINGER_SCAN_NOT_FOUND,
+  FINGER_SCAN_ERROR
+};
+
+enum SecurityLevel {
+  SECURITY_LOW = 0,
+  SECURITY_MEDIUM = 1,
+  SECURITY_HIGH = 2,
+  SECURITY_ADVANCED = 3
+};
+
+// -------------------- Estado global --------------------
+Adafruit_Fingerprint finger = Adafruit_Fingerprint(&SENSOR_SERIAL);
+static Bounce2::Button botonSalidaDebounced = Bounce2::Button();
+static Bounce2::Button botonExt1Debounced = Bounce2::Button();
+static Bounce2::Button botonExt2Debounced = Bounce2::Button();
+static Bounce2::Button botonExt3Debounced = Bounce2::Button();
+static Bounce2::Button botonExt4Debounced = Bounce2::Button();
+
+static DatosUsuario usuarios[MAX_USUARIOS_EN_MEMORIA];
+static uint16_t totalUsuariosAlmacenados = 0;
+
+static DatosUsuario tempUserHolder;
+static uint8_t tempIdHuellaHolder = 0;
+static char tempDocumentoHolder[DOCUMENTO_MAX_LENGTH] = {0};
+
+static SystemState currentSystemState = IDLE;
+static unsigned long lastInteractionTimeCloud = 0;
+
+static uint8_t currentVolume = VOLUMEN_INICIAL;
+
+static bool cloudConnectedPrev = false;
+static bool wifiConnectedPrev = false;
+static bool sensorHuellasInicializadoOK = false;
+static bool audioInicializadoOK = false;
+static bool procesandoHuellaActual = false;
+
+static bool doorIsOpen = false;
+static unsigned long doorCloseAt = 0;
+static String lastDoorReason = "";
+
+static bool botonSalidaEnabled = true;
+static bool botonesExternosEnabled = true;
+static bool doorSilentClosePending = false;
+static SecurityLevel securityLevel = SECURITY_LOW;
+static bool lcdBacklightOn = true;
+static unsigned long lcdBacklightOffAt = 0;
+static bool lcdPostBootReinitPending = false;
+static unsigned long lcdPostBootReinitAt = 0;
+static bool huellaEsperandoRetiro = false;
+static unsigned long huellaEsperandoRetiroDesdeMs = 0;
+
+static unsigned long lastFingerPollMs = 0;
+static unsigned long lastLcdRefreshMs = 0;
+static unsigned long lastLcdHealthKickMs = 0;
+static unsigned long lastCloudOfflineUpdateMs = 0;
+static unsigned long lastCloudReconnectAttemptMs = 0;
+static unsigned long lastRtcPollMs = 0;
+static unsigned long lastRtcSyncAttemptMs = 0;
+static unsigned long lastRtcSyncSuccessMs = 0;
+static int lastRtcMinuteShown = -1;
+static int lastButtonSecurityMinute = -1;
+static bool rtcTimeValid = false;
+
+static char lcdDateLine[30] = "--/--/----";
+static char lcdTimeLine[18] = "--:-- --";
+static char lcdWifiLine[22] = "WiFi: OFF";
+
+// -------------------- Persistencia QSPI --------------------
+static const uint32_t USERS_DB_MAGIC = 0x47434153;  // "GCAS"
+static const uint16_t USERS_DB_VERSION = 1;
+static const char *USERS_DB_PATH = "/user/users.bin";
+static const uint32_t SECURITY_CFG_MAGIC = 0x53454346;  // "SECF"
+static const uint16_t SECURITY_CFG_VERSION = 1;
+static const char *SECURITY_CFG_PATH = "/user/security.bin";
+
+static mbed::BlockDevice *qspiRootBlock = nullptr;
+static mbed::MBRBlockDevice *qspiUserPartition = nullptr;
+static mbed::LittleFileSystem qspiUserFs("user");
+static bool qspiStorageReady = false;
+
+static String lastOutboundChat = "";
+static unsigned long lastOutboundChatAt = 0;
+
+static char lcdEventLine1[22] = "Iniciando...";
+static char lcdEventLine2[22] = "";
+static unsigned long lcdEventUntilMs = 0;
+
+// -------------------- Mensajes base --------------------
+static const char *MSG_INITIATE_MENU_PROMPT =
+  "Bienvenido al Asistente de Acceso.\n"
+  "Escribe 'menu' para comenzar o 'ayuda' para mas opciones.";
+
+static const char *MSG_INVALID_OPTION_MENU =
+  "Opcion no valida. Elige un numero del menu o 'cancelar'.";
+
+static const char *MSG_SESSION_TIMEOUT_CLOUD =
+  "Sesion de chat finalizada por inactividad.\n"
+  "Escribe 'menu' para volver a empezar.";
+
+static const char *MSG_CANCELLED_BY_USER =
+  "Operacion cancelada por el usuario.\n"
+  "Escribe 'menu' para volver a empezar.";
+
+static const char *MSG_GENERAL_ERROR_CLOUD =
+  "Ha ocurrido un error en el chat. Intenta de nuevo.\n"
+  "Escribe 'menu' para empezar.";
+
+static const char *MSG_MAX_USERS_REACHED =
+  "Error: Limite de usuarios en memoria alcanzado.";
+
+// -------------------- Prototipos --------------------
+void onLed2Change();
+void onChatChange();
+void onNotificationChange();
+
+void enviarMensajeChat(const String &mensaje, bool appendInstruction = false);
+void sendNotification(const String &message);
+
+void resetSessionCloud(const String &previousMessage = "");
+void mostrarMenuPrincipalCloud();
+void procesarOpcionMenuPrincipalCloud(const String &opcion);
+void procesarMensajeChat(const String &msg);
+
+void iniciarRegistroUsuarioCloud();
+void procesarNombreUsuarioCloud(const String &nombre);
+void procesarDocumentoUsuarioCloud(const String &documento);
+void procesarTelefonoUsuarioCloud(const String &telefono);
+void procesarFechaNacimientoCloud(const String &fechaNac);
+void ejecutarRegistroHuellaCloud();
+void finalizarRegistroUsuarioCloud(bool exitoHuella);
+
+void iniciarEliminacionUsuarioCloud();
+void procesarIdentificadorParaEliminarCloud(const String &identificador);
+void confirmarYEliminarUsuarioCloud(const String &confirmacion);
+
+void mostrarUsuariosCloud();
+
+void iniciarAjusteVolumenCloud();
+void procesarNuevoVolumenCloud(const String &volStr);
+void iniciarAjusteSeguridadCloud();
+void procesarNivelSeguridadCloud(const String &nivelStr);
+
+void renderLcd();
+void initLcdRobusta();
+void pulseLcdResetHardware();
+void lcdTask();
+const char *stateToText(SystemState state);
+const char *securityLevelToText(SecurityLevel level);
+void setLcdEvent(const String &msg, uint32_t durationMs = 3500);
+void splitTextToLcdLines(const String &msg, char *line1, size_t n1, char *line2, size_t n2);
+void drawCenteredLine(uint8_t y, const char *text);
+
+void inicializarAudio();
+uint8_t calcularChecksumAudio(const uint8_t *commandBytes, size_t length);
+bool enviarComandoAudio(const uint8_t *commandBytes, size_t length, uint8_t maxRetries = 1);
+void reproducirPistaAudio(uint16_t trackNumber, bool esperarFinalizacion = false);
+void configurarVolumenAudio(uint8_t volume, bool guardarVolumenActual = true);
+
+bool inicializarSensorHuellasR503();
+FingerScanResult escanearHuella(uint8_t *idHuella, uint16_t timeoutMs);
+bool esperarRetiroDedoDelSensor(unsigned long timeoutMs = 8000);
+uint8_t obtenerSiguienteIdHuellaDisponibleEnSensor();
+bool registrarNuevaHuellaParaUsuario(uint8_t idHuellaDestino);
+
+int buscarIndiceUsuarioPorDocumento(const char *documentoBuscado);
+int buscarIndiceUsuarioPorHuella(uint8_t idHuellaBuscada);
+uint16_t contarUsuariosActivos();
+int obtenerIndiceLibreUsuario();
+int buscarIndiceUsuarioPorNombre(const char *nombreBuscado);
+
+bool inicializarStorageQSPI();
+bool cargarUsuariosDesdeQSPI();
+bool guardarUsuariosEnQSPI();
+bool cargarSeguridadDesdeQSPI();
+bool guardarSeguridadEnQSPI();
+
+bool validarFechaNacimiento(const String &fecha);
+bool esSoloDigitos(const String &texto);
+void esperarConCloud(unsigned long ms);
+void esperarSinCloud(unsigned long ms);
+bool reconnectWiFiBurst(uint8_t attempts, uint32_t settleMs, const char *originTag);
+bool reconnectCloudBurst(uint8_t attempts, uint32_t settleMs, const char *originTag);
+void bootstrapConnectivitySetup();
+bool isWiFiConnected();
+bool isCloudConnected();
+void cloudTask();
+void rtcTask();
+bool getRtcLocal(tm *outTime);
+bool syncRtcFromWiFiTime(bool force = false);
+void updateRtcDisplayCache(const tm &currentTime, bool force = false);
+void updateSecurityLevelPolicy(const tm *currentTime, bool force = false);
+void setSecurityLevel(SecurityLevel newLevel, bool notifyCloud = true);
+void setExitButtonEnabled(bool enabled);
+void setExternalButtonsEnabled(bool enabled);
+void setLedBotonSalida(bool on);
+void setLcdBacklight(bool on);
+void requestDisplayWake(uint32_t holdMs = DISPLAY_WAKE_HOLD_MS);
+void displayBacklightTask();
+void buttonsTask();
+void procesarHuellaEnIdle();
+void doorTask();
+void doorOpenRequest(const char *reason, uint16_t trackNumber);
+void doorOpenFromExitButton();
+void setRelayState(bool open);
+
+void sensorLedSet(uint8_t color, uint8_t mode, uint8_t speed = 0);
+void sensorLedOff();
+
+// -------------------- Setup --------------------
+void setup() {
+  Serial.begin(115200);
+  delay(1500);
+
+  Serial.println();
+  Serial.println(F("=== Giga_Casa: Cloud + Chat + R503 + MP3 + ST7565 ==="));
+
+  // Pantalla
+  pinMode(PIN_LCD_BACKLIGHT, OUTPUT);
+  setLcdBacklight(true);
+  initLcdRobusta();
+  setLcdEvent("Iniciando sistema...", 2500);
+
+  // Relay y boton de salida
+  pinMode(PIN_RELAY, OUTPUT);
+  setRelayState(false);
+
+  pinMode(PIN_LED_BOTON_SALIDA, OUTPUT);
+  setLedBotonSalida(true);
+
+  // Boton local de salida: equivalente a FALLING (presionado = LOW).
+  botonSalidaDebounced.attach(PIN_BOTON_SALIDA, INPUT_PULLUP);
+  botonSalidaDebounced.interval(BTN_DEBOUNCE_MS);
+  botonSalidaDebounced.setPressedState(LOW);
+  botonSalidaEnabled = true;
+
+  // Botones externos: equivalente a RISING (presionado = HIGH).
+  botonExt1Debounced.attach(PIN_BOTON_EXT_1, INPUT_PULLDOWN);
+  botonExt1Debounced.interval(BTN_EXT_DEBOUNCE_MS);
+  botonExt1Debounced.setPressedState(HIGH);
+
+  botonExt2Debounced.attach(PIN_BOTON_EXT_2, INPUT_PULLDOWN);
+  botonExt2Debounced.interval(BTN_EXT_DEBOUNCE_MS);
+  botonExt2Debounced.setPressedState(HIGH);
+
+  botonExt3Debounced.attach(PIN_BOTON_EXT_3, INPUT_PULLDOWN);
+  botonExt3Debounced.interval(BTN_EXT_DEBOUNCE_MS);
+  botonExt3Debounced.setPressedState(HIGH);
+
+  botonExt4Debounced.attach(PIN_BOTON_EXT_4, INPUT_PULLDOWN);
+  botonExt4Debounced.interval(BTN_EXT_DEBOUNCE_MS);
+  botonExt4Debounced.setPressedState(HIGH);
+  botonesExternosEnabled = true;
+
+  // Cloud
+  initProperties();
+  ArduinoCloud.begin(ArduinoIoTPreferredConnection);
+  setDebugMessageLevel(0);
+
+  // Estado inicial de propiedades cloud
+  led2 = false;
+  notification = "";
+
+  // Audio MP3
+  inicializarAudio();
+
+  // Sensor R503
+  sensorHuellasInicializadoOK = inicializarSensorHuellasR503();
+
+  // Persistencia QSPI (particion usuario MBR #4)
+  qspiStorageReady = inicializarStorageQSPI();
+  if (qspiStorageReady) {
+    if (cargarUsuariosDesdeQSPI()) {
+      Serial.print(F("[QSPI] Usuarios cargados. Activos: "));
+      Serial.println(contarUsuariosActivos());
+    } else {
+      Serial.println(F("[QSPI] Error cargando users.bin (continuando con RAM)."));
+    }
+    cargarSeguridadDesdeQSPI();
+  } else {
+    Serial.println(F("[QSPI] No disponible (continuando con RAM)."));
+  }
+
+  currentSystemState = IDLE;
+  lastInteractionTimeCloud = millis();
+  lastCloudReconnectAttemptMs = millis();
+  lastCloudOfflineUpdateMs = millis();
+  lastRtcSyncAttemptMs = millis() - RTC_RESYNC_RETRY_MS;
+  lastLcdRefreshMs = millis();
+  lastLcdHealthKickMs = millis();
+
+  bootstrapConnectivitySetup();
+  wifiConnectedPrev = isWiFiConnected();
+  cloudConnectedPrev = isCloudConnected();
+
+  if (wifiConnectedPrev) {
+    syncRtcFromWiFiTime(true);
+  }
+
+  tm nowTime;
+  if (getRtcLocal(&nowTime)) {
+    updateRtcDisplayCache(nowTime, true);
+  } else {
+    rtcTimeValid = false;
+  }
+
+  setSecurityLevel(securityLevel, false);
+  requestDisplayWake(LCD_STARTUP_WAKE_MS);
+  lcdPostBootReinitPending = true;
+  lcdPostBootReinitAt = millis() + LCD_POST_BOOT_REINIT_DELAY_MS;
+
+  if (isCloudConnected()) {
+    enviarMensajeChat(MSG_INITIATE_MENU_PROMPT, false);
+  }
+
+  if (audioInicializadoOK) {
+    reproducirPistaAudio(AUDIO_BIENVENIDA, false);
+  }
+
+  setLcdEvent("Sistema listo.", 2500);
+  renderLcd();
+}
+
+// -------------------- Loop --------------------
+void loop() {
+  if (lcdPostBootReinitPending && (long)(millis() - lcdPostBootReinitAt) >= 0) {
+    lcdPostBootReinitPending = false;
+    initLcdRobusta();
+    requestDisplayWake(LCD_STARTUP_WAKE_MS);
+    setLcdEvent("LCD re-inicializada", 1200);
+    renderLcd();
+  }
+
+  // Prioridad local: botones, huella, puerta y pantalla, incluso sin internet.
+  buttonsTask();
+  doorTask();
+  rtcTask();
+  displayBacklightTask();
+  lcdTask();
+
+  if (currentSystemState == IDLE && sensorHuellasInicializadoOK && !procesandoHuellaActual) {
+    if (millis() - lastFingerPollMs >= FINGER_POLL_INTERVAL_MS) {
+      lastFingerPollMs = millis();
+      procesarHuellaEnIdle();
+    }
+  }
+
+  cloudTask();
+
+  const bool wifiNow = isWiFiConnected();
+  if (wifiNow != wifiConnectedPrev) {
+    wifiConnectedPrev = wifiNow;
+    Serial.println(wifiNow ? F("[WIFI] Conectado.") : F("[WIFI] Desconectado."));
+    setLcdEvent(wifiNow ? "WiFi conectado" : "WiFi desconectado", 2500);
+    if (wifiNow) {
+      syncRtcFromWiFiTime(true);
+    }
+  }
+
+  const bool cloudNow = isCloudConnected();
+  if (cloudNow != cloudConnectedPrev) {
+    cloudConnectedPrev = cloudNow;
+    Serial.println(cloudNow ? F("[CLOUD] Conectado.") : F("[CLOUD] Desconectado."));
+    setLcdEvent(cloudNow ? "Cloud conectada" : "Cloud desconectada", 2500);
+  }
+
+  if (isCloudConnected() &&
+      currentSystemState != IDLE &&
+      currentSystemState != ADD_USER_PROCESSING_FINGERPRINT &&
+      currentSystemState != DELETE_USER_PROCESSING) {
+    if (millis() - lastInteractionTimeCloud > CLOUD_SESSION_TIMEOUT_MS) {
+      resetSessionCloud(MSG_SESSION_TIMEOUT_CLOUD);
+    }
+  }
+}
+
+// -------------------- Cloud callbacks --------------------
+void onLed2Change() {
+  if (!isCloudConnected()) {
+    led2 = false;
+    return;
+  }
+
+  Serial.print(F("[EVENTO] led2 cambio desde dashboard: "));
+  Serial.println(led2 ? F("ON (boton activado)") : F("OFF (boton desactivado)"));
+
+  if (led2) {
+    led2 = false;  // comportamiento tipo pulso
+    doorOpenRequest("CLOUD", AUDIO_ABRIENDO_PUERTA);
+  } else {
+    setLcdEvent("led2 OFF desde Cloud", 3000);
+  }
+}
+
+void onChatChange() {
+  String mensajeRecibido = chat;
+  mensajeRecibido.trim();
+
+  if (mensajeRecibido.length() == 0) {
+    return;
+  }
+
+  // Evita procesar eco inmediato de mensajes enviados por el propio dispositivo.
+  if (mensajeRecibido == lastOutboundChat && (millis() - lastOutboundChatAt) < 5000) {
+    Serial.println(F("[CHAT] Eco local ignorado."));
+    return;
+  }
+
+  Serial.print(F("[CHAT] Recibido: '"));
+  Serial.print(mensajeRecibido);
+  Serial.println(F("'"));
+
+  if (!isCloudConnected()) {
+    Serial.println(F("[CHAT] No conectado a cloud. Ignorando."));
+    return;
+  }
+
+  lastInteractionTimeCloud = millis();
+  procesarMensajeChat(mensajeRecibido);
+}
+
+void onNotificationChange() {
+  if (isCloudConnected()) {
+    Serial.print(F("[INFO] notification actualizada: "));
+    Serial.println(notification);
+  }
+}
+
+// -------------------- Chat / menu --------------------
+void enviarMensajeChat(const String &mensaje, bool appendInstruction) {
+  String finalMessage = mensaje;
+
+  if (appendInstruction && currentSystemState != IDLE && currentSystemState != MAIN_MENU_AWAITING_CHOICE) {
+    finalMessage += "\nEscribe 'menu' para volver o 'cancelar' para anular.";
+  }
+
+  setLcdEvent(finalMessage, 4500);
+
+  if (!isCloudConnected()) {
+    Serial.println(F("[CHAT] Mensaje local, sin envio (WiFi/Cloud OFF)."));
+    return;
+  }
+
+  lastOutboundChat = finalMessage;
+  lastOutboundChatAt = millis();
+  chat = finalMessage;
+
+  Serial.print(F("[CHAT->CLOUD] "));
+  Serial.println(finalMessage);
+}
+
+void sendNotification(const String &message) {
+  if (!isCloudConnected()) {
+    return;
+  }
+
+  notification = message;
+  Serial.print(F("[NOTIF] "));
+  Serial.println(message);
+}
+
+void resetSessionCloud(const String &previousMessage) {
+  if (previousMessage.length() > 0) {
+    enviarMensajeChat(previousMessage, false);
+  }
+
+  currentSystemState = IDLE;
+  memset(&tempUserHolder, 0, sizeof(DatosUsuario));
+  tempIdHuellaHolder = 0;
+  memset(tempDocumentoHolder, 0, sizeof(tempDocumentoHolder));
+  procesandoHuellaActual = false;
+
+  Serial.println(F("[CHAT] Sesion reiniciada (IDLE)."));
+}
+
+void mostrarMenuPrincipalCloud() {
+  String menu = "Menu Principal:\n";
+  menu += "1. Registrar Usuario\n";
+  menu += "2. Eliminar Usuario\n";
+  menu += "3. Ver Usuarios\n";
+  menu += "4. Ajustar Volumen\n";
+  menu += "5. Nivel de Seguridad\n\n";
+  menu += "Escribe el numero de la opcion o 'cancelar'.";
+
+  enviarMensajeChat(menu, false);
+  currentSystemState = MAIN_MENU_AWAITING_CHOICE;
+}
+
+void procesarOpcionMenuPrincipalCloud(const String &opcion) {
+  String opt = opcion;
+  opt.trim();
+
+  if (opt == "1") {
+    iniciarRegistroUsuarioCloud();
+  } else if (opt == "2") {
+    iniciarEliminacionUsuarioCloud();
+  } else if (opt == "3") {
+    mostrarUsuariosCloud();
+  } else if (opt == "4") {
+    iniciarAjusteVolumenCloud();
+  } else if (opt == "5") {
+    iniciarAjusteSeguridadCloud();
+  } else {
+    enviarMensajeChat(MSG_INVALID_OPTION_MENU, false);
+  }
+}
+
+void procesarMensajeChat(const String &msg) {
+  if (!isCloudConnected()) {
+    resetSessionCloud("Sin conexion WiFi/Cloud. Intenta cuando haya internet.");
+    return;
+  }
+
+  String mensaje = msg;
+  mensaje.trim();
+
+  String command = mensaje;
+  command.toLowerCase();
+
+  if (command == "cancelar" &&
+      currentSystemState != IDLE &&
+      currentSystemState != ADD_USER_PROCESSING_FINGERPRINT &&
+      currentSystemState != DELETE_USER_PROCESSING) {
+    resetSessionCloud(MSG_CANCELLED_BY_USER);
+    return;
+  }
+
+  if (command == "ayuda") {
+    enviarMensajeChat(MSG_INITIATE_MENU_PROMPT, false);
+    return;
+  }
+
+  switch (currentSystemState) {
+    case IDLE:
+      if (command == "menu" || command.startsWith("hola")) {
+        mostrarMenuPrincipalCloud();
+      } else if (command == "usuarios") {
+        mostrarUsuariosCloud();
+      } else {
+        enviarMensajeChat(MSG_INITIATE_MENU_PROMPT, false);
+      }
+      break;
+
+    case MAIN_MENU_AWAITING_CHOICE:
+      procesarOpcionMenuPrincipalCloud(mensaje);
+      break;
+
+    case ADD_USER_AWAITING_NAME:
+      procesarNombreUsuarioCloud(mensaje);
+      break;
+
+    case ADD_USER_AWAITING_DOCUMENT:
+      procesarDocumentoUsuarioCloud(mensaje);
+      break;
+
+    case ADD_USER_AWAITING_PHONE:
+      procesarTelefonoUsuarioCloud(mensaje);
+      break;
+
+    case ADD_USER_AWAITING_BIRTHDATE:
+      procesarFechaNacimientoCloud(mensaje);
+      break;
+
+    case ADD_USER_INITIATE_FINGERPRINT:
+      if (command == "ok" || command == "listo" || command == "siguiente") {
+        ejecutarRegistroHuellaCloud();
+      } else {
+        enviarMensajeChat(
+          "Para continuar con la huella escribe 'ok' o 'listo'.\n"
+          "Para cancelar escribe 'cancelar'.",
+          false
+        );
+      }
+      break;
+
+    case DELETE_USER_AWAITING_IDENTIFIER:
+      procesarIdentificadorParaEliminarCloud(mensaje);
+      break;
+
+    case DELETE_USER_CONFIRMING:
+      confirmarYEliminarUsuarioCloud(mensaje);
+      break;
+
+    case ADJUST_VOLUME_AWAITING_LEVEL:
+      procesarNuevoVolumenCloud(mensaje);
+      break;
+
+    case ADJUST_SECURITY_AWAITING_LEVEL:
+      procesarNivelSeguridadCloud(mensaje);
+      break;
+
+    default:
+      Serial.print(F("[CHAT] Estado inesperado: "));
+      Serial.println((int)currentSystemState);
+      resetSessionCloud(MSG_GENERAL_ERROR_CLOUD);
+      break;
+  }
+}
+
+// -------------------- Registro de usuario --------------------
+void iniciarRegistroUsuarioCloud() {
+  if (!isCloudConnected()) {
+    resetSessionCloud("Se requiere WiFi/Cloud para registrar usuarios.");
+    return;
+  }
+
+  if (!sensorHuellasInicializadoOK) {
+    resetSessionCloud("Sensor de huellas no disponible. No se puede registrar.");
+    return;
+  }
+
+  if (obtenerIndiceLibreUsuario() < 0) {
+    resetSessionCloud(MSG_MAX_USERS_REACHED);
+    return;
+  }
+
+  memset(&tempUserHolder, 0, sizeof(DatosUsuario));
+  tempUserHolder.activo = true;
+
+  reproducirPistaAudio(AUDIO_USER_ADD, false);
+  enviarMensajeChat("Registrando nuevo usuario...\nIngrese solo el NOMBRE:", false);
+  currentSystemState = ADD_USER_AWAITING_NAME;
+}
+void procesarNombreUsuarioCloud(const String &nombre) {
+  if (nombre.length() == 0 || nombre.length() >= NOMBRE_MAX_LENGTH) {
+    enviarMensajeChat("Nombre invalido o muy largo. Intente de nuevo:", false);
+    return;
+  }
+
+  if (buscarIndiceUsuarioPorNombre(nombre.c_str()) != -1) {
+    enviarMensajeChat("Ya existe un usuario activo con ese nombre. Ingrese otro nombre:", false);
+    return;
+  }
+
+  strncpy(tempUserHolder.nombre, nombre.c_str(), NOMBRE_MAX_LENGTH - 1);
+  tempUserHolder.nombre[NOMBRE_MAX_LENGTH - 1] = '\0';
+
+  tempUserHolder.documento[0] = '\0';
+  tempUserHolder.telefono[0] = '\0';
+  tempUserHolder.fechaNacimiento[0] = '\0';
+
+  tempIdHuellaHolder = obtenerSiguienteIdHuellaDisponibleEnSensor();
+  if (tempIdHuellaHolder == 0) {
+    resetSessionCloud("No hay IDs de huella disponibles en el sensor.");
+    return;
+  }
+
+  reproducirPistaAudio(AUDIO_CONFIRT_DATA, false);
+
+  String msg = "Nombre recibido: " + String(tempUserHolder.nombre) + "\n";
+  msg += "ID Huella asignado: " + String(tempIdHuellaHolder) + "\n";
+  msg += "Escribe 'ok' para iniciar captura de huella.";
+  enviarMensajeChat(msg, false);
+  currentSystemState = ADD_USER_INITIATE_FINGERPRINT;
+}
+void procesarTelefonoUsuarioCloud(const String &telefono) {
+  (void)telefono;
+  enviarMensajeChat("En esta version solo se solicita nombre. Escribe el nombre:", false);
+  currentSystemState = ADD_USER_AWAITING_NAME;
+}
+void procesarFechaNacimientoCloud(const String &fechaNac) {
+  (void)fechaNac;
+  enviarMensajeChat("En esta version solo se solicita nombre. Escribe el nombre:", false);
+  currentSystemState = ADD_USER_AWAITING_NAME;
+}
+void procesarDocumentoUsuarioCloud(const String &documento) {
+  (void)documento;
+  enviarMensajeChat("En esta version solo se solicita nombre. Escribe el nombre:", false);
+  currentSystemState = ADD_USER_AWAITING_NAME;
+}
+void ejecutarRegistroHuellaCloud() {
+  if (!sensorHuellasInicializadoOK) {
+    resetSessionCloud("Sensor no disponible.");
+    return;
+  }
+  if (procesandoHuellaActual) {
+    return;
+  }
+
+  procesandoHuellaActual = true;
+  sensorLedOff();
+  currentSystemState = ADD_USER_PROCESSING_FINGERPRINT;
+
+  enviarMensajeChat(
+    "Iniciando captura de huella.\n"
+    "Siga las instrucciones de audio. No escriba en chat hasta terminar.",
+    false
+  );
+
+  bool exitoHuella = false;
+  for (int intento = 0; intento < MAX_REINTENTOS_REGISTRO; ++intento) {
+    if (registrarNuevaHuellaParaUsuario(tempIdHuellaHolder)) {
+      exitoHuella = true;
+      break;
+    }
+
+    if (intento < MAX_REINTENTOS_REGISTRO - 1) {
+      enviarMensajeChat("Intento de registro fallido. Reintentando...", false);
+      esperarConCloud(1200);
+    }
+  }
+
+  finalizarRegistroUsuarioCloud(exitoHuella);
+  procesandoHuellaActual = false;
+}
+void finalizarRegistroUsuarioCloud(bool exitoHuella) {
+  if (exitoHuella) {
+    int indiceLibre = obtenerIndiceLibreUsuario();
+    if (indiceLibre < 0) {
+      // Si no hay espacio local, eliminamos la plantilla recien registrada para no dejar inconsistencia.
+      finger.deleteModel(tempIdHuellaHolder);
+      reproducirPistaAudio(AUDIO_ERROR, false);
+      resetSessionCloud(MSG_MAX_USERS_REACHED);
+      return;
+    }
+
+    tempUserHolder.idHuella = tempIdHuellaHolder;
+    usuarios[indiceLibre] = tempUserHolder;
+    if (indiceLibre == (int)totalUsuariosAlmacenados) {
+      totalUsuariosAlmacenados++;
+    }
+
+    bool persistOk = guardarUsuariosEnQSPI();
+
+    String notificacion = "REGISTRO:\nNombre: " + String(tempUserHolder.nombre) +
+                          "\nID Huella: " + String(tempIdHuellaHolder);
+    if (!persistOk && qspiStorageReady) {
+      notificacion += "\nADVERTENCIA: no se pudo guardar en QSPI";
+    }
+
+    sendNotification(notificacion);
+    reproducirPistaAudio(AUDIO_USER_ADD, false);
+
+    String msg = "USUARIO REGISTRADO CON EXITO!\n";
+    msg += "Nombre: " + String(tempUserHolder.nombre) + "\n";
+    msg += "ID Huella: " + String(tempIdHuellaHolder);
+    if (!persistOk && qspiStorageReady) {
+      msg += "\n(Advertencia: QSPI no guardada)";
+    }
+    resetSessionCloud(msg);
+  } else {
+    reproducirPistaAudio(AUDIO_ERROR, false);
+    resetSessionCloud("Fallo el registro de huella. Usuario no registrado.");
+  }
+}
+
+
+
+// -------------------- Eliminar usuario --------------------
+void iniciarEliminacionUsuarioCloud() {
+  if (!isCloudConnected()) {
+    resetSessionCloud("Se requiere WiFi/Cloud para eliminar usuarios.");
+    return;
+  }
+
+  if (contarUsuariosActivos() == 0) {
+    resetSessionCloud("No hay usuarios registrados para eliminar.");
+    return;
+  }
+
+  enviarMensajeChat("Ingrese ID de huella o nombre del usuario a eliminar:", false);
+  currentSystemState = DELETE_USER_AWAITING_IDENTIFIER;
+}
+void procesarIdentificadorParaEliminarCloud(const String &identificador) {
+  if (identificador.length() == 0) {
+    enviarMensajeChat("El identificador no puede estar vacio.", false);
+    return;
+  }
+
+  int indice = -1;
+  if (esSoloDigitos(identificador)) {
+    int id = identificador.toInt();
+    if (id > 0 && id <= 255) {
+      indice = buscarIndiceUsuarioPorHuella((uint8_t)id);
+    }
+  } else {
+    indice = buscarIndiceUsuarioPorNombre(identificador.c_str());
+  }
+
+  if (indice == -1) {
+    enviarMensajeChat("No se encontro usuario con ese dato. Intente de nuevo o 'cancelar'.", false);
+    return;
+  }
+
+  tempIdHuellaHolder = usuarios[indice].idHuella;
+
+  String msg = "Usuario a eliminar:\n";
+  msg += "Nombre: " + String(usuarios[indice].nombre) + "\n";
+  msg += "Huella ID: " + String(usuarios[indice].idHuella) + "\n";
+  msg += "Confirma eliminacion? (s/n)";
+
+  enviarMensajeChat(msg, false);
+  currentSystemState = DELETE_USER_CONFIRMING;
+}
+void confirmarYEliminarUsuarioCloud(const String &confirmacion) {
+  String conf = confirmacion;
+  conf.toLowerCase();
+
+  if (!(conf == "s" || conf == "si")) {
+    resetSessionCloud("Eliminacion cancelada por el usuario.");
+    return;
+  }
+
+  currentSystemState = DELETE_USER_PROCESSING;
+
+  int indice = buscarIndiceUsuarioPorHuella(tempIdHuellaHolder);
+  if (indice == -1) {
+    resetSessionCloud("Error interno: no se pudo identificar el usuario a eliminar.");
+    return;
+  }
+
+  bool eliminadoDelSensor = true;
+  uint8_t p = FINGERPRINT_OK;
+
+  if (tempIdHuellaHolder > 0 && sensorHuellasInicializadoOK) {
+    p = finger.deleteModel(tempIdHuellaHolder);
+    if (p == FINGERPRINT_OK || p == FINGERPRINT_BADLOCATION) {
+      eliminadoDelSensor = true;
+    } else {
+      eliminadoDelSensor = false;
+    }
+  }
+
+  usuarios[indice].activo = false;
+  bool persistOk = guardarUsuariosEnQSPI();
+
+  String resultado = "ELIMINADO: " + String(usuarios[indice].nombre);
+
+  if (tempIdHuellaHolder > 0) {
+    if (eliminadoDelSensor) {
+      resultado += "\nHuella ID " + String(tempIdHuellaHolder) + " eliminada.";
+      reproducirPistaAudio(AUDIO_USER_DELETE, false);
+    } else {
+      resultado += "\nHuella ID " + String(tempIdHuellaHolder) + " NO eliminada (err " + String(p) + ").";
+      reproducirPistaAudio(AUDIO_ERROR, false);
+    }
+  }
+
+  if (!persistOk && qspiStorageReady) {
+    resultado += "\nADVERTENCIA: no se pudo guardar en QSPI";
+  }
+
+  sendNotification(resultado);
+  resetSessionCloud(resultado);
+}
+
+
+
+// -------------------- Ver usuarios --------------------
+void mostrarUsuariosCloud() {
+  if (!isCloudConnected()) {
+    resetSessionCloud("Se requiere WiFi/Cloud para consultar usuarios por chat.");
+    return;
+  }
+
+  int activos = (int)contarUsuariosActivos();
+  if (activos == 0) {
+    resetSessionCloud("No hay usuarios registrados.");
+    return;
+  }
+
+  String lista = "--- Usuarios Activos ---\n";
+  int contador = 0;
+
+  for (uint16_t i = 0; i < totalUsuariosAlmacenados; ++i) {
+    if (!usuarios[i].activo) {
+      continue;
+    }
+
+    contador++;
+    lista += String(contador) + ". " + String(usuarios[i].nombre) + "\n";
+    lista += "   Huella ID: " + String(usuarios[i].idHuella) + "\n";
+    lista += "------------------------\n";
+
+    // Evitar crecer demasiado el String en una sola propiedad cloud.
+    if (lista.length() > 900) {
+      lista += "(Lista truncada)\n";
+      break;
+    }
+  }
+
+  lista += "Total activos: " + String(activos);
+
+  enviarMensajeChat(lista, false);
+  resetSessionCloud();
+}
+
+
+
+// -------------------- Volumen --------------------
+void iniciarAjusteVolumenCloud() {
+  if (!isCloudConnected()) {
+    resetSessionCloud("Se requiere WiFi/Cloud para ajustar volumen desde chat.");
+    return;
+  }
+
+  String msg = "Volumen actual: " + String(currentVolume) + "\n";
+  msg += "Ingrese nuevo nivel (0-" + String(VOLUMEN_MAX) + ")\n";
+  msg += "o escriba 'subir' / 'bajar'.";
+
+  enviarMensajeChat(msg, false);
+  currentSystemState = ADJUST_VOLUME_AWAITING_LEVEL;
+}
+void procesarNuevoVolumenCloud(const String &volStr) {
+  String cmd = volStr;
+  cmd.trim();
+
+  String lower = cmd;
+  lower.toLowerCase();
+
+  int vol = -1;
+
+  if (lower == "subir") {
+    vol = (currentVolume < VOLUMEN_MAX) ? (currentVolume + 1) : VOLUMEN_MAX;
+  } else if (lower == "bajar") {
+    vol = (currentVolume > 0) ? (currentVolume - 1) : 0;
+  } else {
+    int parsed = cmd.toInt();
+    if (cmd == "0") {
+      vol = 0;
+    } else if (parsed > 0 && parsed <= VOLUMEN_MAX) {
+      vol = parsed;
+    }
+  }
+
+  if (vol < 0 || vol > VOLUMEN_MAX) {
+    enviarMensajeChat("Valor invalido. Use 0-" + String(VOLUMEN_MAX) + ", subir o bajar.", false);
+    return;
+  }
+
+  configurarVolumenAudio((uint8_t)vol, true);
+
+  if (currentVolume > 0) {
+    reproducirPistaAudio(AUDIO_EXITO, false);
+  }
+
+  resetSessionCloud("Volumen ajustado a: " + String(currentVolume));
+}
+
+void iniciarAjusteSeguridadCloud() {
+  if (!isCloudConnected()) {
+    resetSessionCloud("Se requiere WiFi/Cloud para cambiar nivel de seguridad.");
+    return;
+  }
+
+  String msg = "Nivel actual: " + String(securityLevelToText(securityLevel)) + "\n";
+  msg += "Selecciona nivel:\n";
+  msg += "1. Bajo\n";
+  msg += "2. Medio\n";
+  msg += "3. Alto\n";
+  msg += "4. Avanzado\n";
+  msg += "Escribe numero o nombre.";
+  enviarMensajeChat(msg, false);
+  currentSystemState = ADJUST_SECURITY_AWAITING_LEVEL;
+}
+
+void procesarNivelSeguridadCloud(const String &nivelStr) {
+  String cmd = nivelStr;
+  cmd.trim();
+
+  String lower = cmd;
+  lower.toLowerCase();
+
+  SecurityLevel newLevel = securityLevel;
+  bool valid = true;
+
+  if (lower == "1" || lower == "bajo") {
+    newLevel = SECURITY_LOW;
+  } else if (lower == "2" || lower == "medio") {
+    newLevel = SECURITY_MEDIUM;
+  } else if (lower == "3" || lower == "alto") {
+    newLevel = SECURITY_HIGH;
+  } else if (lower == "4" || lower == "avanzado") {
+    newLevel = SECURITY_ADVANCED;
+  } else {
+    valid = false;
+  }
+
+  if (!valid) {
+    enviarMensajeChat("Nivel invalido. Usa: 1-bajo, 2-medio, 3-alto, 4-avanzado.", false);
+    return;
+  }
+
+  setSecurityLevel(newLevel, true);
+  resetSessionCloud("Nivel de seguridad aplicado: " + String(securityLevelToText(securityLevel)));
+}
+
+// -------------------- Relay / boton / LED sensor --------------------
+
+void buttonsTask() {
+  botonSalidaDebounced.update();
+  botonExt1Debounced.update();
+  botonExt2Debounced.update();
+  botonExt3Debounced.update();
+  botonExt4Debounced.update();
+
+  if (botonSalidaDebounced.pressed()) {
+    requestDisplayWake();
+    if (botonSalidaEnabled) {
+      doorOpenFromExitButton();
+    } else {
+      setLcdEvent("Boton salida bloqueado", 2200);
+    }
+  }
+
+  if (botonesExternosEnabled && botonExt1Debounced.pressed()) {
+    requestDisplayWake();
+    doorOpenRequest("BOTON_EXT_26", AUDIO_BIENVENIDA);
+  }
+  if (botonesExternosEnabled && botonExt2Debounced.pressed()) {
+    requestDisplayWake();
+    doorOpenRequest("BOTON_EXT_28", AUDIO_BIENVENIDA);
+  }
+  if (botonesExternosEnabled && botonExt3Debounced.pressed()) {
+    requestDisplayWake();
+    doorOpenRequest("BOTON_EXT_30", AUDIO_BIENVENIDA);
+  }
+  if (botonesExternosEnabled && botonExt4Debounced.pressed()) {
+    requestDisplayWake();
+    doorOpenRequest("BOTON_EXT_32", AUDIO_BIENVENIDA);
+  }
+}
+
+void setLcdBacklight(bool on) {
+  lcdBacklightOn = on;
+  if (LCD_BACKLIGHT_ACTIVE_HIGH) {
+    digitalWrite(PIN_LCD_BACKLIGHT, on ? HIGH : LOW);
+  } else {
+    digitalWrite(PIN_LCD_BACKLIGHT, on ? LOW : HIGH);
+  }
+}
+
+void requestDisplayWake(uint32_t holdMs) {
+  if (securityLevel == SECURITY_LOW) {
+    setLcdBacklight(true);
+    lcdBacklightOffAt = 0;
+    return;
+  }
+
+  setLcdBacklight(true);
+  lcdBacklightOffAt = millis() + holdMs;
+}
+
+void displayBacklightTask() {
+  if (securityLevel == SECURITY_LOW) {
+    if (!lcdBacklightOn) {
+      setLcdBacklight(true);
+    }
+    return;
+  }
+
+  if (!lcdBacklightOn) {
+    return;
+  }
+
+  if ((long)(millis() - lcdBacklightOffAt) >= 0) {
+    setLcdBacklight(false);
+  }
+}
+
+void setLedBotonSalida(bool on) {
+  if (LED_BOTON_ACTIVE_HIGH) {
+    digitalWrite(PIN_LED_BOTON_SALIDA, on ? HIGH : LOW);
+  } else {
+    digitalWrite(PIN_LED_BOTON_SALIDA, on ? LOW : HIGH);
+  }
+}
+
+void setExternalButtonsEnabled(bool enabled) {
+  if (botonesExternosEnabled == enabled) {
+    return;
+  }
+
+  botonesExternosEnabled = enabled;
+}
+
+void setExitButtonEnabled(bool enabled) {
+  botonSalidaEnabled = enabled;
+  // LED rojo ligado al estado habilitado del boton local.
+  setLedBotonSalida(enabled);
+}
+
+void setRelayState(bool open) {
+  if (RELAY_ACTIVE_LOW) {
+    digitalWrite(PIN_RELAY, open ? LOW : HIGH);
+  } else {
+    digitalWrite(PIN_RELAY, open ? HIGH : LOW);
+  }
+}
+
+void doorOpenRequest(const char *reason, uint16_t trackNumber) {
+  if (reason == nullptr) {
+    reason = "UNKNOWN";
+  }
+
+  requestDisplayWake();
+
+  if (!doorIsOpen) {
+    setRelayState(true);
+    doorIsOpen = true;
+    Serial.print(F("[RELAY] Abierto por: "));
+    Serial.println(reason);
+  } else {
+    Serial.print(F("[RELAY] Extendiendo tiempo por: "));
+    Serial.println(reason);
+  }
+
+  doorCloseAt = millis() + RELAY_OPEN_MS;
+  lastDoorReason = String(reason);
+
+  if (trackNumber > 0) {
+    reproducirPistaAudio(AUDIO_ABRIENDO_PUERTA, false);
+  }
+
+  String msg = "Puerta abierta: " + String(reason);
+  setLcdEvent(msg, 2500);
+  sendNotification("PUERTA ABIERTA: " + String(reason));
+}
+
+void doorOpenFromExitButton() {
+  if (!botonSalidaEnabled) {
+    return;
+  }
+
+  if (!doorIsOpen) {
+    setRelayState(true);
+    doorIsOpen = true;
+    doorSilentClosePending = true;
+  }
+
+  doorCloseAt = millis() + RELAY_OPEN_MS;
+  lastDoorReason = "BOTON_LOCAL";
+  reproducirPistaAudio(AUDIO_ABRIENDO_PUERTA, false);
+}
+
+void doorTask() {
+  if (!doorIsOpen) {
+    return;
+  }
+
+  if ((long)(millis() - doorCloseAt) < 0) {
+    return;
+  }
+
+  setRelayState(false);
+  doorIsOpen = false;
+  if (!doorSilentClosePending) {
+    Serial.print(F("[RELAY] Cerrado. Ultima fuente: "));
+    Serial.println(lastDoorReason);
+    setLcdEvent("Puerta cerrada", 1800);
+  } else {
+    doorSilentClosePending = false;
+  }
+}
+
+void sensorLedSet(uint8_t color, uint8_t mode, uint8_t speed) {
+  finger.LEDcontrol(mode, speed, color, 0);
+}
+
+void sensorLedOff() {
+  finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, FINGERPRINT_LED_OFF, 0);
+}
+
+
+
+// -------------------- Audio MP3 --------------------
+void inicializarAudio() {
+  Serial.println(F("[AUDIO] Inicializando modulo MP3 (UART Serial3)..."));
+
+  MP3_SERIAL.begin(9600);
+  esperarConCloud(250);
+
+  audioInicializadoOK = true;
+  configurarVolumenAudio(VOLUMEN_INICIAL, true);
+
+  Serial.println(F("[AUDIO] Inicializado."));
+  setLcdEvent("Audio OK", 2000);
+}
+uint8_t calcularChecksumAudio(const uint8_t *commandBytes, size_t length) {
+  uint16_t sum = 0;
+  for (size_t i = 0; i + 1 < length; i++) {
+    sum += commandBytes[i];
+  }
+  return (uint8_t)sum;
+}
+bool enviarComandoAudio(const uint8_t *commandBytes, size_t length, uint8_t maxRetries) {
+  if (!audioInicializadoOK) {
+    return false;
+  }
+
+  for (uint8_t retry = 0; retry < maxRetries; retry++) {
+    MP3_SERIAL.write(commandBytes, length);
+    MP3_SERIAL.flush();
+    delay(30);
+    return true;
+  }
+
+  return false;
+}
+void reproducirPistaAudio(uint16_t trackNumber, bool esperarFinalizacion) {
+  if (!audioInicializadoOK) {
+    return;
+  }
+
+  uint8_t upperByte = (uint8_t)(trackNumber >> 8);
+  uint8_t lowerByte = (uint8_t)(trackNumber & 0xFF);
+
+  uint8_t cmd[6] = {0xAA, 0x07, 0x02, upperByte, lowerByte, 0x00};
+  cmd[5] = calcularChecksumAudio(cmd, sizeof(cmd));
+
+  if (!enviarComandoAudio(cmd, sizeof(cmd), 1)) {
+    Serial.println(F("[AUDIO] Error enviando comando de pista."));
+    return;
+  }
+
+  Serial.print(F("[AUDIO] Reproduciendo pista #"));
+  Serial.println(trackNumber);
+
+  if (esperarFinalizacion) {
+    esperarConCloud(2500);
+  }
+}
+void configurarVolumenAudio(uint8_t volume, bool guardarVolumenActual) {
+  if (!audioInicializadoOK) {
+    return;
+  }
+
+  if (volume > VOLUMEN_MAX) {
+    volume = VOLUMEN_MAX;
+  }
+
+  if (guardarVolumenActual) {
+    currentVolume = volume;
+  }
+
+  uint8_t cmd[5] = {0xAA, 0x13, 0x01, volume, 0x00};
+  cmd[4] = calcularChecksumAudio(cmd, sizeof(cmd));
+
+  if (!enviarComandoAudio(cmd, sizeof(cmd), 1)) {
+    Serial.println(F("[AUDIO] Error configurando volumen."));
+    return;
+  }
+
+  Serial.print(F("[AUDIO] Volumen = "));
+  Serial.println(volume);
+}
+
+
+
+// -------------------- Sensor huella R503 --------------------
+bool inicializarSensorHuellasR503() {
+  Serial.println(F("[R503] Inicializando sensor en Serial2..."));
+
+  SENSOR_SERIAL.begin(57600);
+  esperarConCloud(120);
+  finger.begin(57600);
+
+  for (int intento = 0; intento < 3; intento++) {
+    if (finger.verifyPassword()) {
+      finger.getParameters();
+      finger.getTemplateCount();
+
+      Serial.println(F("[R503] Sensor OK."));
+      Serial.print(F("[R503] Capacidad: "));
+      Serial.println(finger.capacity);
+      Serial.print(F("[R503] Plantillas en sensor: "));
+      Serial.println(finger.templateCount);
+
+      sensorLedOff();
+      setLcdEvent("R503 OK", 2000);
+      return true;
+    }
+
+    Serial.print(F("[R503] Intento fallido #"));
+    Serial.println(intento + 1);
+    esperarConCloud(400);
+  }
+
+  Serial.println(F("[R503] No se detecto sensor o password invalida."));
+  sensorLedSet(FINGERPRINT_LED_RED, FINGERPRINT_LED_FLASHING, 120);
+  setLcdEvent("R503 ERROR", 3000);
+  return false;
+}
+FingerScanResult escanearHuella(uint8_t *idHuella, uint16_t timeoutMs) {
+  if (!sensorHuellasInicializadoOK) {
+    return FINGER_SCAN_ERROR;
+  }
+
+  unsigned long start = millis();
+  uint8_t p = FINGERPRINT_NOFINGER;
+
+  while (millis() - start < timeoutMs) {
+    p = finger.getImage();
+    if (p == FINGERPRINT_OK) {
+      break;
+    }
+    if (p == FINGERPRINT_NOFINGER) {
+      return FINGER_SCAN_NONE;
+    }
+    if (p == FINGERPRINT_PACKETRECIEVEERR) {
+      esperarConCloud(30);
+      continue;
+    }
+    return FINGER_SCAN_ERROR;
+  }
+
+  if (p != FINGERPRINT_OK) {
+    return FINGER_SCAN_NONE;
+  }
+
+  p = finger.image2Tz();
+  if (p != FINGERPRINT_OK) {
+    return FINGER_SCAN_ERROR;
+  }
+
+  p = finger.fingerSearch();
+  if (p == FINGERPRINT_OK) {
+    *idHuella = (uint8_t)finger.fingerID;
+    return FINGER_SCAN_MATCH;
+  }
+
+  if (p == FINGERPRINT_NOTFOUND) {
+    return FINGER_SCAN_NOT_FOUND;
+  }
+
+  return FINGER_SCAN_ERROR;
+}
+bool esperarRetiroDedoDelSensor(unsigned long timeoutMs) {
+  unsigned long start = millis();
+  while (millis() - start < timeoutMs) {
+    uint8_t p = finger.getImage();
+    if (p == FINGERPRINT_NOFINGER) {
+      esperarConCloud(150);
+      return true;
+    }
+    esperarConCloud(50);
+  }
+  return false;
+}
+uint8_t obtenerSiguienteIdHuellaDisponibleEnSensor() {
+  if (!sensorHuellasInicializadoOK) {
+    return 0;
+  }
+
+  uint16_t cap = finger.capacity;
+  if (cap == 0 || cap > 255) {
+    cap = 255;
+  }
+
+  for (uint16_t id = 1; id <= cap; id++) {
+    bool usadoLocal = false;
+    for (uint16_t i = 0; i < totalUsuariosAlmacenados; i++) {
+      if (usuarios[i].activo && usuarios[i].idHuella == (uint8_t)id) {
+        usadoLocal = true;
+        break;
+      }
+    }
+    if (usadoLocal) {
+      continue;
+    }
+
+    // Verifica si ese ID existe en el sensor.
+    uint8_t p = finger.loadModel((uint16_t)id);
+    if (p == FINGERPRINT_OK) {
+      continue;  // ocupado en sensor
+    }
+
+    return (uint8_t)id;
+  }
+
+  return 0;
+}
+bool registrarNuevaHuellaParaUsuario(uint8_t idHuellaDestino) {
+  if (!sensorHuellasInicializadoOK || idHuellaDestino == 0) {
+    return false;
+  }
+
+  int p = -1;
+
+  Serial.println(F("[R503] Registro de huella iniciado."));
+  Serial.print(F("[R503] ID destino: "));
+  Serial.println(idHuellaDestino);
+
+  // Paso 1
+  sensorLedSet(FINGERPRINT_LED_BLUE, FINGERPRINT_LED_ON, 0);
+  reproducirPistaAudio(AUDIO_COLOQUE_DEDO, false);
+  setLcdEvent("Coloque el dedo", 3000);
+
+  unsigned long start = millis();
+  while (millis() - start < TIMEOUT_OPERACION_HUELLA) {
+    p = finger.getImage();
+    if (p == FINGERPRINT_OK) {
+      break;
+    }
+    if (p == FINGERPRINT_NOFINGER) {
+      esperarConCloud(80);
+      continue;
+    }
+    if (p == FINGERPRINT_PACKETRECIEVEERR) {
+      esperarConCloud(40);
+      continue;
+    }
+
+    Serial.print(F("[R503] Error capturando imagen 1: "));
+    Serial.println(p);
+    sensorLedSet(FINGERPRINT_LED_RED, FINGERPRINT_LED_FLASHING, 120);
+    reproducirPistaAudio(AUDIO_ERROR, false);
+    return false;
+  }
+
+  if (p != FINGERPRINT_OK) {
+    Serial.println(F("[R503] Timeout en imagen 1."));
+    sensorLedSet(FINGERPRINT_LED_RED, FINGERPRINT_LED_FLASHING, 120);
+    reproducirPistaAudio(AUDIO_ERROR, false);
+    return false;
+  }
+
+  p = finger.image2Tz(1);
+  if (p != FINGERPRINT_OK) {
+    Serial.print(F("[R503] Error image2Tz(1): "));
+    Serial.println(p);
+    sensorLedSet(FINGERPRINT_LED_RED, FINGERPRINT_LED_FLASHING, 120);
+    reproducirPistaAudio(AUDIO_ERROR, false);
+    return false;
+  }
+
+  reproducirPistaAudio(AUDIO_RETIRE_DEDO, false);
+  setLcdEvent("Retire el dedo", 2500);
+
+  if (!esperarRetiroDedoDelSensor(TIMEOUT_OPERACION_HUELLA / 2)) {
+    Serial.println(F("[R503] Timeout esperando retiro de dedo."));
+    sensorLedSet(FINGERPRINT_LED_RED, FINGERPRINT_LED_FLASHING, 120);
+    reproducirPistaAudio(AUDIO_ERROR, false);
+    return false;
+  }
+
+  // Paso 2
+  sensorLedSet(FINGERPRINT_LED_BLUE, FINGERPRINT_LED_ON, 0);
+  reproducirPistaAudio(AUDIO_COLOQUE_DEDO2, false);
+  setLcdEvent("Mismo dedo otra vez", 3000);
+
+  start = millis();
+  while (millis() - start < TIMEOUT_OPERACION_HUELLA) {
+    p = finger.getImage();
+    if (p == FINGERPRINT_OK) {
+      break;
+    }
+    if (p == FINGERPRINT_NOFINGER) {
+      esperarConCloud(80);
+      continue;
+    }
+    if (p == FINGERPRINT_PACKETRECIEVEERR) {
+      esperarConCloud(40);
+      continue;
+    }
+
+    Serial.print(F("[R503] Error capturando imagen 2: "));
+    Serial.println(p);
+    sensorLedSet(FINGERPRINT_LED_RED, FINGERPRINT_LED_FLASHING, 120);
+    reproducirPistaAudio(AUDIO_ERROR, false);
+    return false;
+  }
+
+  if (p != FINGERPRINT_OK) {
+    Serial.println(F("[R503] Timeout en imagen 2."));
+    sensorLedSet(FINGERPRINT_LED_RED, FINGERPRINT_LED_FLASHING, 120);
+    reproducirPistaAudio(AUDIO_ERROR, false);
+    return false;
+  }
+
+  p = finger.image2Tz(2);
+  if (p != FINGERPRINT_OK) {
+    Serial.print(F("[R503] Error image2Tz(2): "));
+    Serial.println(p);
+    sensorLedSet(FINGERPRINT_LED_RED, FINGERPRINT_LED_FLASHING, 120);
+    reproducirPistaAudio(AUDIO_ERROR, false);
+    return false;
+  }
+
+  p = finger.createModel();
+  if (p != FINGERPRINT_OK) {
+    Serial.print(F("[R503] Error createModel: "));
+    Serial.println(p);
+    sensorLedSet(FINGERPRINT_LED_RED, FINGERPRINT_LED_FLASHING, 120);
+    reproducirPistaAudio(AUDIO_ERROR, false);
+    return false;
+  }
+
+  p = finger.storeModel((uint16_t)idHuellaDestino);
+  if (p != FINGERPRINT_OK) {
+    Serial.print(F("[R503] Error storeModel: "));
+    Serial.println(p);
+    sensorLedSet(FINGERPRINT_LED_RED, FINGERPRINT_LED_FLASHING, 120);
+    reproducirPistaAudio(AUDIO_ERROR, false);
+    return false;
+  }
+
+  Serial.println(F("[R503] Huella registrada con exito."));
+  sensorLedSet(FINGERPRINT_LED_PURPLE, FINGERPRINT_LED_FLASHING, 200);
+  reproducirPistaAudio(AUDIO_EXITO, true);
+  setLcdEvent("Huella registrada", 3000);
+  sensorLedOff();
+  return true;
+}
+void procesarHuellaEnIdle() {
+  // Tras una lectura (ok/no), evitamos reprocesar la misma pulsacion hasta retiro de dedo.
+  if (huellaEsperandoRetiro) {
+    uint8_t p = finger.getImage();
+    if (p == FINGERPRINT_NOFINGER ||
+        (millis() - huellaEsperandoRetiroDesdeMs) >= FINGER_RELEASE_GUARD_MS) {
+      huellaEsperandoRetiro = false;
+      sensorLedOff();
+    }
+    return;
+  }
+
+  uint8_t id = 0;
+  FingerScanResult result = escanearHuella(&id, 120);
+
+  if (result == FINGER_SCAN_NONE) {
+    return;
+  }
+
+  requestDisplayWake();
+
+  // Indicacion inicial al detectar dedo (wakeup / intento de lectura)
+  sensorLedSet(FINGERPRINT_LED_PURPLE, FINGERPRINT_LED_ON, 0);
+
+  if (result == FINGER_SCAN_MATCH) {
+    int indice = buscarIndiceUsuarioPorHuella(id);
+    if (indice != -1 && usuarios[indice].activo) {
+      String msg = "ACCESO OK: " + String(usuarios[indice].nombre) + " (ID " + String(id) + ")";
+      Serial.println(msg);
+      setLcdEvent(msg, 3500);
+      sensorLedSet(FINGERPRINT_LED_BLUE, FINGERPRINT_LED_ON, 50);
+      doorOpenRequest(msg.c_str(), AUDIO_INGRESO_EXITOSO);
+      reproducirPistaAudio(AUDIO_BIENVENIDA, false);
+    } else {
+      String msg = "Huella reconocida sin usuario activo (ID " + String(id) + ")";
+      Serial.println(msg);
+      sendNotification(msg);
+      setLcdEvent(msg, 3500);
+      sensorLedSet(FINGERPRINT_LED_RED, FINGERPRINT_LED_FLASHING, 120);
+      reproducirPistaAudio(AUDIO_ERROR, false);
+    }
+    huellaEsperandoRetiro = true;
+    huellaEsperandoRetiroDesdeMs = millis();
+    return;
+  }
+
+  if (result == FINGER_SCAN_NOT_FOUND) {
+    Serial.println(F("[R503] Huella no reconocida."));
+    sendNotification("Acceso denegado: huella no reconocida");
+    setLcdEvent("Huella no reconocida", 3000);
+    sensorLedSet(FINGERPRINT_LED_RED, FINGERPRINT_LED_FLASHING, 120);
+    reproducirPistaAudio(AUDIO_HUELLA_NO, false);
+    huellaEsperandoRetiro = true;
+    huellaEsperandoRetiroDesdeMs = millis();
+    return;
+  }
+
+  if (result == FINGER_SCAN_ERROR) {
+    Serial.println(F("[R503] Error leyendo huella."));
+    setLcdEvent("Error lectura huella", 2500);
+    sensorLedSet(FINGERPRINT_LED_RED, FINGERPRINT_LED_FLASHING, 120);
+    huellaEsperandoRetiro = true;
+    huellaEsperandoRetiroDesdeMs = millis();
+  }
+}
+
+
+// -------------------- Utilidades usuarios --------------------
+int buscarIndiceUsuarioPorDocumento(const char *documentoBuscado) {
+  if (documentoBuscado == nullptr || strlen(documentoBuscado) == 0) {
+    return -1;
+  }
+
+  for (uint16_t i = 0; i < totalUsuariosAlmacenados; i++) {
+    if (usuarios[i].activo && strcmp(usuarios[i].documento, documentoBuscado) == 0) {
+      return (int)i;
+    }
+  }
+
+  return -1;
+}
+int buscarIndiceUsuarioPorNombre(const char *nombreBuscado) {
+  if (nombreBuscado == nullptr || strlen(nombreBuscado) == 0) {
+    return -1;
+  }
+
+  for (uint16_t i = 0; i < totalUsuariosAlmacenados; i++) {
+    if (usuarios[i].activo && strcmp(usuarios[i].nombre, nombreBuscado) == 0) {
+      return (int)i;
+    }
+  }
+
+  return -1;
+}
+int buscarIndiceUsuarioPorHuella(uint8_t idHuellaBuscada) {
+  if (idHuellaBuscada == 0) {
+    return -1;
+  }
+
+  for (uint16_t i = 0; i < totalUsuariosAlmacenados; i++) {
+    if (usuarios[i].activo && usuarios[i].idHuella == idHuellaBuscada) {
+      return (int)i;
+    }
+  }
+
+  return -1;
+}
+uint16_t contarUsuariosActivos() {
+  uint16_t count = 0;
+  for (uint16_t i = 0; i < totalUsuariosAlmacenados; i++) {
+    if (usuarios[i].activo) {
+      count++;
+    }
+  }
+  return count;
+}
+int obtenerIndiceLibreUsuario() {
+  for (uint16_t i = 0; i < totalUsuariosAlmacenados; i++) {
+    if (!usuarios[i].activo) {
+      return (int)i;
+    }
+  }
+
+  if (totalUsuariosAlmacenados < MAX_USUARIOS_EN_MEMORIA) {
+    return (int)totalUsuariosAlmacenados;
+  }
+
+  return -1;
+}
+bool inicializarStorageQSPI() {
+  qspiRootBlock = mbed::BlockDevice::get_default_instance();
+  if (qspiRootBlock == nullptr) {
+    Serial.println(F("[QSPI] BlockDevice por defecto no disponible."));
+    return false;
+  }
+
+  if (qspiUserPartition == nullptr) {
+    qspiUserPartition = new mbed::MBRBlockDevice(qspiRootBlock, 4);
+    if (qspiUserPartition == nullptr) {
+      Serial.println(F("[QSPI] Sin memoria para MBRBlockDevice."));
+      return false;
+    }
+  }
+
+  int rc = qspiUserFs.mount(qspiUserPartition);
+  if (rc) {
+    Serial.print(F("[QSPI] Mount en particion user fallo (rc="));
+    Serial.print(rc);
+    Serial.println(F(")."));
+    Serial.println(F("[QSPI] No se hace reformat automatico para proteger WiFi/OTA."));
+    Serial.println(F("[QSPI] Ejecuta QSPIFormat y selecciona LittleFS en user partition."));
+    return false;
+  }
+
+  Serial.println(F("[QSPI] Particion user montada (MBR #4, LittleFS)."));
+  return true;
+}
+bool cargarUsuariosDesdeQSPI() {
+  if (!qspiStorageReady) {
+    return false;
+  }
+
+  memset(usuarios, 0, sizeof(usuarios));
+  totalUsuariosAlmacenados = 0;
+
+  FILE *file = fopen(USERS_DB_PATH, "rb");
+  if (!file) {
+    Serial.println(F("[QSPI] users.bin no existe. Base inicial vacia."));
+    return true;
+  }
+
+  UsersDbHeader hdr;
+  if (fread(&hdr, sizeof(hdr), 1, file) != 1) {
+    Serial.println(F("[QSPI] Error leyendo cabecera de users.bin."));
+    fclose(file);
+    return false;
+  }
+
+  if (hdr.magic != USERS_DB_MAGIC || hdr.version != USERS_DB_VERSION || hdr.structSize != sizeof(DatosUsuario)) {
+    Serial.println(F("[QSPI] Cabecera incompatible. Datos persistidos ignorados."));
+    fclose(file);
+    return false;
+  }
+
+  if (hdr.totalSlots > MAX_USUARIOS_EN_MEMORIA) {
+    Serial.println(F("[QSPI] totalSlots invalido en users.bin."));
+    fclose(file);
+    return false;
+  }
+
+  if (fread(usuarios, sizeof(DatosUsuario), MAX_USUARIOS_EN_MEMORIA, file) != MAX_USUARIOS_EN_MEMORIA) {
+    Serial.println(F("[QSPI] Error leyendo tabla de usuarios."));
+    fclose(file);
+    return false;
+  }
+  fclose(file);
+
+  totalUsuariosAlmacenados = hdr.totalSlots;
+  return true;
+}
+bool guardarUsuariosEnQSPI() {
+  if (!qspiStorageReady) {
+    return false;
+  }
+
+  FILE *file = fopen(USERS_DB_PATH, "wb");
+  if (!file) {
+    Serial.println(F("[QSPI] No se pudo abrir users.bin para escritura."));
+    return false;
+  }
+
+  UsersDbHeader hdr;
+  hdr.magic = USERS_DB_MAGIC;
+  hdr.version = USERS_DB_VERSION;
+  hdr.structSize = sizeof(DatosUsuario);
+  hdr.totalSlots = totalUsuariosAlmacenados;
+
+  bool ok = true;
+  if (fwrite(&hdr, sizeof(hdr), 1, file) != 1) ok = false;
+  if (ok && fwrite(usuarios, sizeof(DatosUsuario), MAX_USUARIOS_EN_MEMORIA, file) != MAX_USUARIOS_EN_MEMORIA) ok = false;
+  if (ok && fflush(file) != 0) ok = false;
+  fclose(file);
+
+  if (!ok) {
+    Serial.println(F("[QSPI] Error guardando users.bin."));
+    return false;
+  }
+
+  return true;
+}
+bool cargarSeguridadDesdeQSPI() {
+  if (!qspiStorageReady) {
+    return false;
+  }
+
+  FILE *file = fopen(SECURITY_CFG_PATH, "rb");
+  if (!file) {
+    return false;
+  }
+
+  SecurityConfigRecord cfg;
+  bool ok = (fread(&cfg, sizeof(cfg), 1, file) == 1);
+  fclose(file);
+  if (!ok) {
+    return false;
+  }
+
+  if (cfg.magic != SECURITY_CFG_MAGIC || cfg.version != SECURITY_CFG_VERSION) {
+    return false;
+  }
+
+  if (cfg.securityLevel > SECURITY_ADVANCED) {
+    return false;
+  }
+
+  securityLevel = (SecurityLevel)cfg.securityLevel;
+  return true;
+}
+bool guardarSeguridadEnQSPI() {
+  if (!qspiStorageReady) {
+    return false;
+  }
+
+  FILE *file = fopen(SECURITY_CFG_PATH, "wb");
+  if (!file) {
+    return false;
+  }
+
+  SecurityConfigRecord cfg;
+  cfg.magic = SECURITY_CFG_MAGIC;
+  cfg.version = SECURITY_CFG_VERSION;
+  cfg.securityLevel = (uint8_t)securityLevel;
+  cfg.reserved = 0;
+
+  bool ok = true;
+  if (fwrite(&cfg, sizeof(cfg), 1, file) != 1) ok = false;
+  if (ok && fflush(file) != 0) ok = false;
+  fclose(file);
+
+  return ok;
+}
+
+
+
+// -------------------- Utilidades generales --------------------
+bool validarFechaNacimiento(const String &fecha) {
+  if (fecha.length() != 10) {
+    return false;
+  }
+  if (fecha.charAt(2) != '/' || fecha.charAt(5) != '/') {
+    return false;
+  }
+
+  int dia = fecha.substring(0, 2).toInt();
+  int mes = fecha.substring(3, 5).toInt();
+  int anio = fecha.substring(6, 10).toInt();
+
+  if (dia < 1 || dia > 31) {
+    return false;
+  }
+  if (mes < 1 || mes > 12) {
+    return false;
+  }
+  if (anio < 1900 || anio > 2100) {
+    return false;
+  }
+
+  return true;
+}
+bool esSoloDigitos(const String &texto) {
+  if (texto.length() == 0) {
+    return false;
+  }
+
+  for (unsigned int i = 0; i < texto.length(); i++) {
+    if (!isdigit(texto.charAt(i))) {
+      return false;
+    }
+  }
+
+  return true;
+}
+void esperarSinCloud(unsigned long ms) {
+  unsigned long start = millis();
+  while (millis() - start < ms) {
+    buttonsTask();
+    doorTask();
+
+    if (currentSystemState == IDLE && sensorHuellasInicializadoOK && !procesandoHuellaActual) {
+      if (millis() - lastFingerPollMs >= FINGER_POLL_INTERVAL_MS) {
+        lastFingerPollMs = millis();
+        procesarHuellaEnIdle();
+      }
+    }
+
+    rtcTask();
+    displayBacklightTask();
+    lcdTask();
+    delay(10);
+  }
+}
+
+void esperarConCloud(unsigned long ms) {
+  unsigned long start = millis();
+  while (millis() - start < ms) {
+    esperarSinCloud(10);
+    cloudTask();
+  }
+}
+
+bool reconnectWiFiBurst(uint8_t attempts, uint32_t settleMs, const char *originTag) {
+  if (attempts == 0) {
+    return isWiFiConnected();
+  }
+
+  Serial.print(F("[WIFI] Iniciando rafaga "));
+  Serial.print(originTag ? originTag : "RUN");
+  Serial.println(F("..."));
+
+  for (uint8_t intento = 1; intento <= attempts; ++intento) {
+    if (isWiFiConnected()) {
+      Serial.println(F("[WIFI] Conexion ya activa."));
+      return true;
+    }
+
+    Serial.print(F("[WIFI] Intento "));
+    Serial.print(intento);
+    Serial.print(F("/"));
+    Serial.println(attempts);
+
+    ArduinoIoTPreferredConnection.disconnect();
+    esperarSinCloud(WIFI_RETRY_GAP_MS);
+    ArduinoIoTPreferredConnection.connect();
+
+    unsigned long settleStart = millis();
+    while (millis() - settleStart < settleMs) {
+      ArduinoCloud.update();
+      if (isWiFiConnected()) {
+        Serial.println(F("[WIFI] Conexion recuperada."));
+        return true;
+      }
+      esperarSinCloud(25);
+    }
+  }
+
+  Serial.println(F("[WIFI] Sin conexion tras rafaga; se reintentara luego."));
+  return false;
+}
+
+bool reconnectCloudBurst(uint8_t attempts, uint32_t settleMs, const char *originTag) {
+  if (!isWiFiConnected()) {
+    return false;
+  }
+  if (attempts == 0) {
+    return ArduinoCloud.connected();
+  }
+
+  Serial.print(F("[CLOUD] Iniciando rafaga "));
+  Serial.print(originTag ? originTag : "RUN");
+  Serial.println(F("..."));
+
+  for (uint8_t intento = 1; intento <= attempts; ++intento) {
+    if (ArduinoCloud.connected()) {
+      Serial.println(F("[CLOUD] Sesion ya activa."));
+      return true;
+    }
+
+    Serial.print(F("[CLOUD] Intento "));
+    Serial.print(intento);
+    Serial.print(F("/"));
+    Serial.println(attempts);
+
+    ArduinoIoTPreferredConnection.disconnect();
+    esperarSinCloud(CLOUD_RETRY_GAP_MS);
+    ArduinoIoTPreferredConnection.connect();
+
+    unsigned long settleStart = millis();
+    while (millis() - settleStart < settleMs) {
+      ArduinoCloud.update();
+      if (ArduinoCloud.connected()) {
+        Serial.println(F("[CLOUD] Sesion recuperada."));
+        return true;
+      }
+      esperarSinCloud(25);
+    }
+  }
+
+  Serial.println(F("[CLOUD] Sesion no recuperada; se reintentara luego."));
+  return false;
+}
+
+void bootstrapConnectivitySetup() {
+  Serial.println(F("[BOOT] Intentando conexion inicial WiFi/Cloud..."));
+
+  bool wifiOk = isWiFiConnected();
+  if (!wifiOk) {
+    wifiOk = reconnectWiFiBurst(WIFI_BOOT_RETRY_ATTEMPTS, WIFI_BOOT_RETRY_SETTLE_MS, "BOOT-WIFI");
+  }
+
+  if (!wifiOk) {
+    Serial.println(F("[BOOT] Inicio sin internet. Sistema queda en modo local."));
+    return;
+  }
+
+  if (!ArduinoCloud.connected()) {
+    reconnectCloudBurst(CLOUD_BOOT_RETRY_ATTEMPTS, CLOUD_BOOT_RETRY_SETTLE_MS, "BOOT-CLOUD");
+  }
+}
+
+bool isWiFiConnected() {
+  return (WiFi.status() == WL_CONNECTED);
+}
+bool isCloudConnected() {
+  return (isWiFiConnected() && ArduinoCloud.connected());
+}
+void cloudTask() {
+  const unsigned long now = millis();
+  const bool wifiUp = isWiFiConnected();
+  const bool cloudUp = (wifiUp && ArduinoCloud.connected());
+
+  // Sin WiFi: reintento por rafagas espaciadas y sin bloquear tareas locales.
+  if (!wifiUp) {
+    if (now - lastCloudReconnectAttemptMs >= CLOUD_RECONNECT_INTERVAL_MS) {
+      lastCloudReconnectAttemptMs = now;
+      reconnectWiFiBurst(WIFI_RETRY_BURST_ATTEMPTS, WIFI_RETRY_SETTLE_MS, "RUN-WIFI");
+    }
+    return;
+  }
+
+  // WiFi OK + Cloud OK: update frecuente pero temporizado.
+  if (cloudUp) {
+    if (now - lastCloudOfflineUpdateMs >= CLOUD_UPDATE_ONLINE_MS) {
+      lastCloudOfflineUpdateMs = now;
+      ArduinoCloud.update();
+    }
+    return;
+  }
+
+  // WiFi OK + Cloud no conectada: update lento para evitar impacto en huella/botones.
+  if (now - lastCloudOfflineUpdateMs >= CLOUD_UPDATE_OFFLINE_MS) {
+    lastCloudOfflineUpdateMs = now;
+    ArduinoCloud.update();
+  }
+
+  // Reintento de sesion cloud por rafagas espaciadas.
+  if (now - lastCloudReconnectAttemptMs >= CLOUD_RECONNECT_INTERVAL_MS) {
+    lastCloudReconnectAttemptMs = now;
+    reconnectCloudBurst(CLOUD_RETRY_BURST_ATTEMPTS, CLOUD_RETRY_SETTLE_MS, "RUN-CLOUD");
+  }
+}
+bool getRtcLocal(tm *outTime) {
+  if (outTime == nullptr) {
+    return false;
+  }
+
+  const time_t utcEpoch = time(NULL);
+  if (utcEpoch <= 0) {
+    return false;
+  }
+
+  const time_t localEpoch = utcEpoch + RTC_UTC_OFFSET_SECONDS;
+  _rtc_localtime(localEpoch, outTime, RTC_FULL_LEAP_YEAR_SUPPORT);
+  const int year = outTime->tm_year + 1900;
+  return (year >= 2024 && year <= 2100);
+}
+bool syncRtcFromWiFiTime(bool force) {
+  if (!isWiFiConnected()) {
+    return false;
+  }
+
+  const unsigned long now = millis();
+  if (!force && (now - lastRtcSyncSuccessMs) < RTC_RESYNC_INTERVAL_MS) {
+    return true;
+  }
+
+  unsigned long utcEpoch = WiFi.getTime();
+  if (utcEpoch < 1700000000UL) {
+    return false;
+  }
+
+  set_time((time_t)utcEpoch);
+
+  lastRtcSyncSuccessMs = now;
+  rtcTimeValid = true;
+  Serial.println(F("[RTC] Sincronizado con tiempo de red."));
+  return true;
+}
+const char *securityLevelToText(SecurityLevel level) {
+  switch (level) {
+    case SECURITY_LOW: return "Bajo";
+    case SECURITY_MEDIUM: return "Medio";
+    case SECURITY_HIGH: return "Alto";
+    case SECURITY_ADVANCED: return "Avanzado";
+    default: return "Bajo";
+  }
+}
+void updateSecurityLevelPolicy(const tm *currentTime, bool force) {
+  int minuteOfDay = -1;
+  if (currentTime != nullptr) {
+    minuteOfDay = currentTime->tm_hour * 60 + currentTime->tm_min;
+  }
+
+  if (!force) {
+    if (minuteOfDay >= 0 && minuteOfDay == lastButtonSecurityMinute) {
+      return;
+    }
+    if (minuteOfDay < 0 && lastButtonSecurityMinute == -2) {
+      return;
+    }
+  }
+
+  lastButtonSecurityMinute = (minuteOfDay >= 0) ? minuteOfDay : -2;
+
+  bool shouldEnableExitButton = true;
+  bool shouldEnableExternalButtons = true;
+
+  switch (securityLevel) {
+    case SECURITY_LOW:
+      shouldEnableExitButton = true;
+      shouldEnableExternalButtons = true;
+      setLcdBacklight(true);
+      break;
+    case SECURITY_MEDIUM:
+      shouldEnableExternalButtons = true;
+      if (minuteOfDay >= 0) {
+        shouldEnableExitButton = !(minuteOfDay >= MEDIUM_BLOCK_START_MIN && minuteOfDay < MEDIUM_BLOCK_END_MIN);
+      } else {
+        shouldEnableExitButton = true;
+      }
+      break;
+    case SECURITY_HIGH:
+      shouldEnableExitButton = false;
+      shouldEnableExternalButtons = true;
+      break;
+    case SECURITY_ADVANCED:
+      shouldEnableExitButton = false;
+      shouldEnableExternalButtons = false;
+      break;
+    default:
+      shouldEnableExitButton = true;
+      shouldEnableExternalButtons = true;
+      break;
+  }
+
+  bool prevExit = botonSalidaEnabled;
+  bool prevExt = botonesExternosEnabled;
+  setExitButtonEnabled(shouldEnableExitButton);
+  setExternalButtonsEnabled(shouldEnableExternalButtons);
+
+  if (prevExit != botonSalidaEnabled) {
+    setLcdEvent(botonSalidaEnabled ? "Boton salida activo" : "Boton salida inactivo", 2500);
+  }
+  if (prevExt != botonesExternosEnabled) {
+    setLcdEvent(botonesExternosEnabled ? "Botones externos activos" : "Botones externos inactivos", 2500);
+  }
+}
+void setSecurityLevel(SecurityLevel newLevel, bool notifyCloud) {
+  if (newLevel < SECURITY_LOW || newLevel > SECURITY_ADVANCED) {
+    newLevel = SECURITY_LOW;
+  }
+
+  SecurityLevel previousLevel = securityLevel;
+  securityLevel = newLevel;
+  lastButtonSecurityMinute = -1;
+
+  if (securityLevel == SECURITY_LOW) {
+    setLcdBacklight(true);
+    lcdBacklightOffAt = 0;
+  } else {
+    setLcdBacklight(false);
+    lcdBacklightOffAt = 0;
+  }
+
+  tm nowTime;
+  if (getRtcLocal(&nowTime)) {
+    updateSecurityLevelPolicy(&nowTime, true);
+  } else {
+    updateSecurityLevelPolicy(nullptr, true);
+  }
+
+  if (previousLevel != securityLevel) {
+    guardarSeguridadEnQSPI();
+  }
+
+  if (notifyCloud) {
+    sendNotification("Nivel de seguridad: " + String(securityLevelToText(securityLevel)));
+  }
+}
+void updateRtcDisplayCache(const tm &currentTime, bool force) {
+  if (!force && rtcTimeValid && currentTime.tm_min == lastRtcMinuteShown) {
+    return;
+  }
+  lastRtcMinuteShown = currentTime.tm_min;
+
+  static const char *DIAS_ES[] = {"Domingo", "Lunes", "Martes", "Miercoles", "Jueves", "Viernes", "Sabado"};
+  const char *dia = (currentTime.tm_wday >= 0 && currentTime.tm_wday <= 6) ? DIAS_ES[currentTime.tm_wday] : "?";
+
+  int hour12 = currentTime.tm_hour % 12;
+  if (hour12 == 0) {
+    hour12 = 12;
+  }
+  const char *ampm = (currentTime.tm_hour >= 12) ? "pm" : "am";
+
+  snprintf(
+    lcdDateLine,
+    sizeof(lcdDateLine),
+    "%s %02d/%02d/%04d",
+    dia,
+    currentTime.tm_mday,
+    currentTime.tm_mon + 1,
+    currentTime.tm_year + 1900
+  );
+
+  snprintf(
+    lcdTimeLine,
+    sizeof(lcdTimeLine),
+    "%d:%02d %s",
+    hour12,
+    currentTime.tm_min,
+    ampm
+  );
+
+  rtcTimeValid = true;
+}
+void rtcTask() {
+  const unsigned long now = millis();
+  if (now - lastRtcPollMs < RTC_POLL_MS) {
+    return;
+  }
+  lastRtcPollMs = now;
+
+  tm nowTime;
+  if (getRtcLocal(&nowTime)) {
+    updateRtcDisplayCache(nowTime);
+    updateSecurityLevelPolicy(&nowTime);
+  } else {
+    rtcTimeValid = false;
+    lastRtcMinuteShown = -1;
+    snprintf(lcdDateLine, sizeof(lcdDateLine), "RTC sin hora valida");
+    snprintf(lcdTimeLine, sizeof(lcdTimeLine), "--:-- --");
+    updateSecurityLevelPolicy(nullptr);
+  }
+
+  if (!isWiFiConnected()) {
+    return;
+  }
+
+  const uint32_t syncInterval = rtcTimeValid ? RTC_RESYNC_INTERVAL_MS : RTC_RESYNC_RETRY_MS;
+  if (now - lastRtcSyncAttemptMs >= syncInterval) {
+    lastRtcSyncAttemptMs = now;
+    syncRtcFromWiFiTime(false);
+  }
+}
+
+
+
+// -------------------- LCD --------------------
+const char *stateToText(SystemState state) {
+  switch (state) {
+    case IDLE: return "Estado: IDLE";
+    case MAIN_MENU_AWAITING_CHOICE: return "Estado: MENU";
+    case ADD_USER_AWAITING_NAME: return "Reg: Nombre";
+    case ADD_USER_AWAITING_DOCUMENT: return "Reg: Nombre";
+    case ADD_USER_AWAITING_PHONE: return "Reg: Nombre";
+    case ADD_USER_AWAITING_BIRTHDATE: return "Reg: Nombre";
+    case ADD_USER_INITIATE_FINGERPRINT: return "Reg: Huella OK?";
+    case ADD_USER_PROCESSING_FINGERPRINT: return "Reg: Capturando";
+    case DELETE_USER_AWAITING_IDENTIFIER: return "Del: ID/Nombre";
+    case DELETE_USER_CONFIRMING: return "Del: Confirmar";
+    case DELETE_USER_PROCESSING: return "Del: Procesando";
+    case ADJUST_VOLUME_AWAITING_LEVEL: return "Vol: Esperando";
+    case ADJUST_SECURITY_AWAITING_LEVEL: return "Seg: Esperando";
+    default: return "Estado: ?";
+  }
+}
+void pulseLcdResetHardware() {
+  // Pulso de reset fisico para evitar arranques inestables del ST7565.
+  pinMode(PIN_LCD_CS, OUTPUT);
+  pinMode(PIN_LCD_DC, OUTPUT);
+  pinMode(PIN_LCD_SCK, OUTPUT);
+  pinMode(PIN_LCD_MOSI, OUTPUT);
+  pinMode(PIN_LCD_RESET, OUTPUT);
+
+  digitalWrite(PIN_LCD_CS, HIGH);
+  digitalWrite(PIN_LCD_DC, LOW);
+  digitalWrite(PIN_LCD_SCK, LOW);
+  digitalWrite(PIN_LCD_MOSI, LOW);
+  digitalWrite(PIN_LCD_RESET, HIGH);
+  delay(5);
+  digitalWrite(PIN_LCD_RESET, LOW);
+  delay(LCD_RESET_LOW_MS);
+  digitalWrite(PIN_LCD_RESET, HIGH);
+  delay(LCD_RESET_HIGH_MS);
+}
+void initLcdRobusta() {
+  for (uint8_t intento = 1; intento <= LCD_INIT_RETRIES; ++intento) {
+    pulseLcdResetHardware();
+    u8g2.begin();
+    u8g2.setPowerSave(0);
+    u8g2.setContrast(LCD_CONTRAST);
+
+    // Limpia y luego dibuja para estabilizar arranque del controlador.
+    u8g2.clearBuffer();
+    u8g2.sendBuffer();
+    delay(10);
+
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_6x10_tr);
+    u8g2.drawStr(2, 12, "Inicializando LCD...");
+    u8g2.sendBuffer();
+
+    Serial.print(F("[LCD] Init intento "));
+    Serial.println(intento);
+    delay(35);
+  }
+}
+void lcdTask() {
+  const unsigned long now = millis();
+
+  if (now - lastLcdRefreshMs >= LCD_REFRESH_MS) {
+    lastLcdRefreshMs = now;
+    renderLcd();
+  }
+
+  // Keep-alive periodico: evita que el controlador quede en estado inestable.
+  if (now - lastLcdHealthKickMs >= LCD_HEALTH_KICK_MS) {
+    lastLcdHealthKickMs = now;
+    u8g2.setPowerSave(0);
+    u8g2.setContrast(LCD_CONTRAST);
+  }
+}
+void splitTextToLcdLines(const String &msg, char *line1, size_t n1, char *line2, size_t n2) {
+  if (n1 == 0 || n2 == 0) {
+    return;
+  }
+
+  String clean = msg;
+  clean.replace("\n", " ");
+  clean.trim();
+
+  if (clean.length() == 0) {
+    line1[0] = '\0';
+    line2[0] = '\0';
+    return;
+  }
+
+  const int max1 = (int)n1 - 1;
+  const int max2 = (int)n2 - 1;
+
+  String first = clean;
+  if ((int)first.length() > max1) {
+    first = clean.substring(0, max1);
+    int splitPos = first.lastIndexOf(' ');
+    if (splitPos > 8) {
+      first = clean.substring(0, splitPos);
+    }
+  }
+
+  String second = "";
+  if (clean.length() > first.length()) {
+    second = clean.substring(first.length());
+    second.trim();
+    if ((int)second.length() > max2) {
+      second = second.substring(0, max2);
+    }
+  }
+
+  strncpy(line1, first.c_str(), n1 - 1);
+  line1[n1 - 1] = '\0';
+
+  strncpy(line2, second.c_str(), n2 - 1);
+  line2[n2 - 1] = '\0';
+}
+void setLcdEvent(const String &msg, uint32_t durationMs) {
+  splitTextToLcdLines(msg, lcdEventLine1, sizeof(lcdEventLine1), lcdEventLine2, sizeof(lcdEventLine2));
+  lcdEventUntilMs = millis() + durationMs;
+}
+void drawCenteredLine(uint8_t y, const char *text) {
+  if (text == nullptr || text[0] == '\0') {
+    return;
+  }
+
+  int16_t width = (int16_t)u8g2.getStrWidth(text);
+  int16_t x = ((int16_t)u8g2.getDisplayWidth() - width) / 2;
+  if (x < 1) {
+    x = 1;
+  }
+  u8g2.drawStr((uint8_t)x, y, text);
+}
+void renderLcd() {
+  const uint8_t w = u8g2.getDisplayWidth();
+  u8g2.setPowerSave(0);
+  snprintf(lcdWifiLine, sizeof(lcdWifiLine), "WiFi: %s", isWiFiConnected() ? "ON" : "OFF");
+
+  u8g2.clearBuffer();
+
+  u8g2.drawFrame(0, 0, w, 64);
+
+  u8g2.setFont(u8g2_font_6x10_tr);
+  drawCenteredLine(10, lcdDateLine);
+  u8g2.drawHLine(1, 13, w - 2);
+
+  u8g2.setFont(u8g2_font_10x20_tr);
+  drawCenteredLine(35, lcdTimeLine);
+
+  u8g2.setFont(u8g2_font_6x10_tr);
+  drawCenteredLine(47, lcdWifiLine);
+  u8g2.drawHLine(1, 50, w - 2);
+
+  u8g2.setFont(u8g2_font_4x6_tr);
+  if (millis() <= lcdEventUntilMs) {
+    drawCenteredLine(57, lcdEventLine1);
+    if (lcdEventLine2[0] != '\0') {
+      drawCenteredLine(63, lcdEventLine2);
+    }
+  } else {
+    drawCenteredLine(57, stateToText(currentSystemState));
+  }
+
+  u8g2.sendBuffer();
+}

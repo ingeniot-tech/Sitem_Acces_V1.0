@@ -1,0 +1,55 @@
+//Este código es muy importante para el manejo de la memoria externa QSPI que tiene la placa Arduino Giga, ya fue probado y aprobado, tratar de que los datos importantes del control de acceso estén guardados en esta parte, de forma ordenada y estructurada ya sea en vectores dinámicos o en la forma mas optima posible.
+
+#include <BlockDevice.h>
+#include <LittleFileSystem.h>
+
+mbed::BlockDevice *blockDevice = mbed::BlockDevice::get_default_instance();
+mbed::LittleFileSystem fs("fs");
+
+void setup() {
+    Serial.begin(9600);
+    while (!Serial) {}
+
+    // Montar sistema de archivos
+    if (fs.mount(blockDevice)) {
+        Serial.println("Reformateando...");
+        if (fs.reformat(blockDevice)) {
+            Serial.println("Error al formatear");
+            while(1);
+        }
+    }
+
+    // Escribir número y texto
+    FILE *file = fopen("/fs/datos.txt", "w+");
+    if (file) {
+        // Escribir número
+        int numero = 42;
+        fprintf(file, "%d\n", numero);
+        
+        // Escribir texto
+        fprintf(file, "Arduino GIGA R1\n");
+        
+        // Leer datos
+        rewind(file);
+        
+        // Leer número
+        int numLeido;
+        fscanf(file, "%d\n", &numLeido);
+        
+        // Leer texto
+        char textoLeido[50];
+        fgets(textoLeido, sizeof(textoLeido), file);
+        
+        // Mostrar resultados
+        Serial.print("Número leído: ");
+        Serial.println(numLeido);
+        Serial.print("Texto leído: ");
+        Serial.print(textoLeido);
+        
+        fclose(file);
+    }
+
+    fs.unmount();
+}
+
+void loop() {}

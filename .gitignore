@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+
+# Arduino build/cache folders (if created in project)
+build/
+out/
+dist/
+
+# IDE folders
+.vscode/
+.idea/
+
